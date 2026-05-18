@@ -1,0 +1,6 @@
+.env
+model_state.json
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
