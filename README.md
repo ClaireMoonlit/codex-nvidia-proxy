@@ -1,6 +1,7 @@
 # Codex NIM Proxy
 
 > 让 Codex 白嫖 NVIDIA 免费顶级模型：DeepSeek V4 Pro、Qwen3 Coder、Kimi K2.6 一键接入
+> Use Codex with NVIDIA's free top-tier models — one-click access
 
 Codex（CLI / 桌面版）与 NVIDIA NIM 之间的透明代理，让 Codex 免费使用 NVIDIA 托管的顶级模型。
 
