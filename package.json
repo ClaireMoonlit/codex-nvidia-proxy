@@ -1,7 +1,7 @@
 {
   "name": "codex-nvidia-proxy",
   "version": "1.0.0",
-  "description": "Transparent proxy between Codex CLI and NVIDIA NIM, enabling Codex to use NVIDIA's free hosted top-tier models",
+  "description": "Transparent proxy between Codex and NVIDIA NIM, enabling Codex to use NVIDIA's free hosted top-tier models",
   "main": "responses_proxy.cjs",
   "scripts": {
     "start": "node responses_proxy.cjs"
