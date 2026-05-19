@@ -5,11 +5,11 @@
 
 Codex（CLI / 桌面版）与 NVIDIA NIM 之间的透明代理，让 Codex 免费使用 NVIDIA 托管的顶级模型。
 
-## 这是什么
+## 项目简介
 
-[Codex](https://github.com/openai/codex) 是 OpenAI 的 AI 编程助手（提供 CLI 和桌面版），但它默认只能用 OpenAI 的模型。[NVIDIA NIM](https://build.nvidia.com/explore/discover) 免费提供了一批顶级模型（DeepSeek V4 Pro、Qwen3 Coder 480B、Kimi K2.6 等）。
+[Codex](https://github.com/openai/codex) 是 OpenAI 的 AI 编程助手（提供 CLI 和桌面版），但默认只能使用 OpenAI 的模型。[NVIDIA NIM](https://build.nvidia.com/explore/discover) 免费提供 DeepSeek V4 Pro、Qwen3 Coder 480B、Kimi K2.6 等顶级模型。
 
-这个代理坐在中间，把 Codex 的 Responses API 请求透明转换成 NVIDIA NIM 的 Chat Completions API 格式，让 Codex 无缝使用这些模型。
+本项目是一个轻量级代理，在 Codex 和 NVIDIA NIM 之间透明转换 Responses API ↔ Chat Completions API 格式，让 Codex 无缝调用这些免费模型。
 
 ## 支持的模型
 
@@ -46,14 +46,12 @@ Codex --POST /v1/responses--> Proxy (:15721) --POST /v1/chat/completions--> NVID
 
 ## 功能
 
-- **格式透明转换** — Codex `input` 数组 ↔ NVIDIA `messages` 数组，工具定义、图片、输出全部映射
-- **流式处理 (SSE)** — 实时流式输出，思考内容(delta.reasoning_content) 和正文(delta.content) 分离
-- **搜索代理** — 拦截 `web_search` 调用，通过 DuckDuckGo 自行执行搜索，结果注入后多轮推理
-- **外部工具转发** — shell/read/write 等工具调用转发回 Codex 执行
-- **错误重试** — 5 次重试 + 指数退避(1s/2s/4s/8s/12s)，503/429/ECONNRESET 自动重试
-- **SSE 心跳** — 搜索期间每 3s 发送心跳防 idle timeout
-- **模型切换面板** — Web UI `http://127.0.0.1:15721/ui` 可视化管理模型
-- **双向配置同步** — 模型切换自动更新 Codex `config.toml`，thinking 模型自动配置 reasoning
+- **零依赖** — 单文件纯 Node.js，无需 `npm install`
+- **格式透明转换** — 自动处理 Codex Responses API 与 NVIDIA Chat Completions API 之间的所有字段映射
+- **流式输出** — 实时 SSE 流，思考过程和正文分离显示
+- **Web 搜索** — 内置 DuckDuckGo 搜索引擎，Codex 发起搜索时代理自动执行
+- **可视化模型切换** — Web UI 面板一键换模型，自动同步 Codex 配置
+- **自动重试** — 网络波动或服务繁忙时自动重试，无需手动干预
 
 ## 前置条件
 
