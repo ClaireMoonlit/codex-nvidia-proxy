@@ -83,13 +83,15 @@ function writeProxyConfig(modelId) {
         content = content.trim();
 
         // Write provider-based config
-        const providerConfig = 'model_provider = "nvidia-proxy"\n\n' +
+        // NOTE: top-level keys (model_provider, model, model_catalog_json) must be
+        // written BEFORE any [section] headers — TOML scope requires it.
+        const providerConfig = 'model_provider = "nvidia-proxy"\n' +
+            'model = "' + modelId + '"\n' +
+            'model_catalog_json = "model-catalog.json"\n\n' +
             '[model_providers.nvidia-proxy]\n' +
             'name = "NVIDIA NIM Proxy"\n' +
             'base_url = "http://127.0.0.1:15721/v1"\n' +
-            'wire_api = "responses"\n' +
-            'model_catalog_json = "model-catalog.json"\n\n' +
-            'model = "' + modelId + '"\n';
+            'wire_api = "responses"\n';
 
         content = providerConfig + '\n' + content;
 
@@ -562,6 +564,10 @@ load();
 
 function convertRequest(responsesBody) {
     const chatBody = { ...responsesBody };
+    if (DEBUG) {
+        log('RAW request keys:', Object.keys(responsesBody).join(','));
+        log('RAW tools:', JSON.stringify(responsesBody.tools || null) !== 'undefined' ? JSON.stringify(responsesBody.tools).substring(0, 800) : 'none');
+    }
     const hasWebSearchTool = Array.isArray(chatBody.tools) && chatBody.tools.some(
         t => t && (t.type === 'web_search' || t.type === 'web_search_preview')
     );
