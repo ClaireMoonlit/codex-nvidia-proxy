@@ -234,8 +234,28 @@ function log(...args) {
 let currentModel = getCurrentModelFromFile();
 
 stripProxyConfig();
-writeProxyConfig(currentModel || 'deepseek-ai/deepseek-v4-pro');
-writeModelCatalog();
+if (currentModel) {
+    writeProxyConfig(currentModel);
+    writeModelCatalog();
+} else {
+    // No saved model — fetch from NIM to get a valid default
+    fetchNvidiaModels().then(models => {
+        currentModel = (models.length > 0) ? models[0].id : (MODELS.length > 0 ? MODELS[0].id : null);
+        if (currentModel) {
+            writeProxyConfig(currentModel);
+            writeModelCatalog(models.length > 0 ? models : null);
+        } else {
+            console.warn('[Proxy] No models available, config not written');
+        }
+    }).catch(e => {
+        console.warn('[Proxy] Failed to fetch models on startup:', e.message);
+        currentModel = MODELS.length > 0 ? MODELS[0].id : null;
+        if (currentModel) {
+            writeProxyConfig(currentModel);
+            writeModelCatalog();
+        }
+    });
+}
 
 function getCurrentModelFromFile() {
     try {
@@ -520,6 +540,20 @@ function showToast(msg, isError) {
     t.className = 'toast show' + (isError ? ' error' : '');
     setTimeout(() => t.className = 'toast', 2500);
 }
+
+// Poll model list periodically so blacklisted models disappear without manual refresh
+setInterval(async () => {
+    try {
+        const res = await fetch('/api/models');
+        const data = await res.json();
+        const before = models.map(m => m.id).join(',');
+        const after = data.models.map(m => m.id).join(',');
+        if (before !== after) {
+            models = data.models;
+            render();
+        }
+    } catch (e) { /* ignore poll errors */ }
+}, 10000);
 
 load();
 </script>
