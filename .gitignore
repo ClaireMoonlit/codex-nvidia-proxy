@@ -2,6 +2,7 @@
 model_state.json
 model_blacklist.json
 node_modules/
+.npm-cache-codex/
 *.log
 .DS_Store
 Thumbs.db

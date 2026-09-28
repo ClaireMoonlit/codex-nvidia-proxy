@@ -132,11 +132,22 @@ function writeProxyConfig(modelId) {
 
 function writeModelCatalog(models) {
     try {
-        // Codex model catalog schema — verified against official provider catalogs
-        // (MiniMax M3, Z.ai GLM, Alibaba Model Studio). Keep the field set minimal:
-        // `model_messages`, `comp_hash`, `use_responses_lite` etc. are NOT required
-        // and adding them pulls in more required sub-fields. Tool execution is gated
-        // by `shell_type`.
+        // Codex model catalog schema — keep the field set minimal to avoid
+        // pulling in nested required fields such as
+        // `auto_compact_fallback_prompt`.
+        //
+        // `tool_mode` must be "direct" for a third-party OpenAI-compatible
+        // provider (NVIDIA NIM). `code_mode_only` makes Codex collapse the whole
+        // tool surface into a single `exec` freeform tool that is executed by the
+        // `codex-code-mode-host` companion binary and is only understood by
+        // OpenAI's native code-mode models. Non-native models given
+        // `code_mode_only` receive no usable tool schemas, so they answer with
+        // text and never emit a function call.
+        //
+        // `shell_type` only has two effective states: `unified_exec` and
+        // `disabled` (`default`/`local`/`shell_command` are deserialization
+        // aliases of `unified_exec`), so it is not the trigger for tools being
+        // dropped; `tool_mode` is.
         let list = (models && models.length > 0) ? models : (MODELS.length > 0 ? MODELS : BUILTIN_MODELS);
         // Ensure the currently-selected model is present, otherwise Codex won't
         // find a matching slug and silently drops tools.
@@ -162,8 +173,8 @@ function writeModelCatalog(models) {
                         { effort: 'medium', description: 'Balances speed and reasoning depth for everyday tasks' },
                         { effort: 'high', description: 'Greater reasoning depth for complex problems' }
                     ],
-                shell_type: 'shell_command',
-                tool_mode: 'code_mode_only',
+                shell_type: 'unified_exec',
+                tool_mode: 'direct',
                 visibility: 'list',
                 supported_in_api: true,
                 priority: 0,
