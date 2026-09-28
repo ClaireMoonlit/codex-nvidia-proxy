@@ -2,6 +2,7 @@
 model_state.json
 model_blacklist.json
 tool_dump.json
+mcp_hello.cjs
 node_modules/
 .npm-cache-codex/
 *.log

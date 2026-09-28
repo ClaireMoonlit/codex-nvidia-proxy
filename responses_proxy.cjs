@@ -584,8 +584,30 @@ function toChatTool(t) {
             }
         };
     }
-    // `custom` (e.g. `apply_patch`) is freeform and carries no JSON schema, so
-    // it has no Chat Completions equivalent.
+    // `custom` tools (`apply_patch`) are freeform: Codex has no JSON schema for
+    // them, and its router only accepts the call back as a `custom_tool_call`
+    // carrying the raw text in `input`. Chat Completions needs a schema, so the
+    // freeform body rides in a single `input` string field and is unwrapped
+    // again by toResponseCallItem.
+    if (t.type === 'custom' && typeof t.name === 'string') {
+        FREEFORM_TOOLS.add(t.name);
+        return {
+            type: 'function',
+            function: {
+                name: t.name,
+                description: (t.description ? t.description + ' ' : '')
+                    + 'The tool input is freeform text, not structured JSON: pass it verbatim as the `input` string field.',
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        input: { type: 'string', description: 'The raw freeform input for this tool.' }
+                    },
+                    required: ['input'],
+                    additionalProperties: false
+                }
+            }
+        };
+    }
     return null;
 }
 
@@ -595,11 +617,45 @@ function toChatTool(t) {
 // Completions has no such field, so remember how each flattened name maps back
 // and split it apart again on the way out.
 const NAMESPACED_TOOLS = new Map();
+// Custom (freeform) tool names, e.g. `apply_patch`.
+const FREEFORM_TOOLS = new Set();
 function toolNameFields(flatName) {
     const original = NAMESPACED_TOOLS.get(flatName);
     return original
         ? { name: original.name, namespace: original.namespace }
         : { name: flatName };
+}
+
+// The model answers a freeform tool with `{"input": "<raw text>"}`; Codex wants
+// the bare text back in `input`.
+function freeformInput(argumentsText) {
+    if (!argumentsText) return '';
+    try {
+        const parsed = JSON.parse(argumentsText);
+        if (parsed && typeof parsed.input === 'string') return parsed.input;
+    } catch (e) { /* not JSON — hand the raw text straight through */ }
+    return argumentsText;
+}
+
+function toResponseCallItem(id, name, callId, argumentsText, status) {
+    if (FREEFORM_TOOLS.has(name)) {
+        return {
+            id,
+            type: 'custom_tool_call',
+            call_id: callId,
+            name,
+            input: freeformInput(argumentsText),
+            status
+        };
+    }
+    return {
+        id,
+        type: 'function_call',
+        ...toolNameFields(name),
+        call_id: callId,
+        arguments: argumentsText,
+        status
+    };
 }
 
 function expandToolList(tools) {
@@ -1038,14 +1094,9 @@ function buildResponseObjectFromState(state) {
     }
 
     for (const tc of state.functionCalls) {
-        output.push({
-            type: 'function_call',
-            id: responseId + '_fc_' + (tc.index || 0),
-            call_id: tc.id || '',
-            ...toolNameFields(tc.name || ''),
-            arguments: tc.arguments || '',
-            status: 'completed'
-        });
+        output.push(toResponseCallItem(
+            responseId + '_fc_' + (tc.index || 0), tc.name || '', tc.id || '', tc.arguments || '', 'completed'
+        ));
     }
 
     if (state.answerText) {
@@ -1304,20 +1355,22 @@ async function resolveHostedResponseStreaming(res, chatBody) {
             const itemId = tempState.responseId + '_fc_post_' + (tc.index || i);
             await writeSseLine(res, JSON.stringify({
                 type: 'response.output_item.added',
-                item: { id: itemId, type: 'function_call', ...toolNameFields(tc.name), call_id: tc.id, arguments: tc.arguments, status: 'in_progress' },
+                item: toResponseCallItem(itemId, tc.name, tc.id, tc.arguments, 'in_progress'),
                 output_index: fcIdx,
                 sequence_number: tempState.seq++
             }));
-            await writeSseLine(res, JSON.stringify({
-                type: 'response.function_call_arguments.done',
-                arguments: tc.arguments,
-                item_id: itemId,
-                output_index: fcIdx,
-                sequence_number: tempState.seq++
-            }));
+            if (!FREEFORM_TOOLS.has(tc.name)) {
+                await writeSseLine(res, JSON.stringify({
+                    type: 'response.function_call_arguments.done',
+                    arguments: tc.arguments,
+                    item_id: itemId,
+                    output_index: fcIdx,
+                    sequence_number: tempState.seq++
+                }));
+            }
             await writeSseLine(res, JSON.stringify({
                 type: 'response.output_item.done',
-                item: { id: itemId, type: 'function_call', ...toolNameFields(tc.name), call_id: tc.id, arguments: tc.arguments, status: 'completed' },
+                item: toResponseCallItem(itemId, tc.name, tc.id, tc.arguments, 'completed'),
                 output_index: fcIdx,
                 sequence_number: tempState.seq++
             }));
@@ -1777,20 +1830,22 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
             const itemId = state.responseId + '_fc_r' + roundIndex + '_' + tc.index;
             await writeSseLine(res, JSON.stringify({
                 type: 'response.output_item.added',
-                item: { id: itemId, type: 'function_call', ...toolNameFields(tc.name), call_id: tc.id, arguments: tc.arguments, status: 'in_progress' },
+                item: toResponseCallItem(itemId, tc.name, tc.id, tc.arguments, 'in_progress'),
                 output_index: fcIndex,
                 sequence_number: state.seq++
             }));
-            await writeSseLine(res, JSON.stringify({
-                type: 'response.function_call_arguments.done',
-                arguments: tc.arguments,
-                item_id: itemId,
-                output_index: fcIndex,
-                sequence_number: state.seq++
-            }));
+            if (!FREEFORM_TOOLS.has(tc.name)) {
+                await writeSseLine(res, JSON.stringify({
+                    type: 'response.function_call_arguments.done',
+                    arguments: tc.arguments,
+                    item_id: itemId,
+                    output_index: fcIndex,
+                    sequence_number: state.seq++
+                }));
+            }
             await writeSseLine(res, JSON.stringify({
                 type: 'response.output_item.done',
-                item: { id: itemId, type: 'function_call', ...toolNameFields(tc.name), call_id: tc.id, arguments: tc.arguments, status: 'completed' },
+                item: toResponseCallItem(itemId, tc.name, tc.id, tc.arguments, 'completed'),
                 output_index: fcIndex,
                 sequence_number: state.seq++
             }));
@@ -2184,14 +2239,9 @@ function buildNonStreamResponse(chatResp) {
 
     for (const tc of toolCalls) {
         const fn = tc.function || {};
-        output.push({
-            type: 'function_call',
-            id: (chatResp.id || 'resp_proxy') + '_fc_' + (tc.index || 0),
-            call_id: tc.id || '',
-            ...toolNameFields(fn.name || ''),
-            arguments: fn.arguments || '',
-            status: 'completed'
-        });
+        output.push(toResponseCallItem(
+            (chatResp.id || 'resp_proxy') + '_fc_' + (tc.index || 0), fn.name || '', tc.id || '', fn.arguments || '', 'completed'
+        ));
     }
 
     if (answerText) {
