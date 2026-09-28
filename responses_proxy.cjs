@@ -149,9 +149,12 @@ function writeModelCatalog(models) {
         // aliases of `unified_exec`), so it is not the trigger for tools being
         // dropped; `tool_mode` is.
         let list = (models && models.length > 0) ? models : (MODELS.length > 0 ? MODELS : BUILTIN_MODELS);
+        // Drop blacklisted models (e.g. returned 404 / unavailable for this
+        // account) so the desktop picker and CLI `/model` don't keep offering them.
+        list = list.filter(m => m && !BLACKLISTED_MODELS.has(m.id));
         // Ensure the currently-selected model is present, otherwise Codex won't
         // find a matching slug and silently drops tools.
-        if (currentModel && !list.some(x => x.id === currentModel)) {
+        if (currentModel && !BLACKLISTED_MODELS.has(currentModel) && !list.some(x => x.id === currentModel)) {
             list = [{ id: currentModel, name: currentModel, desc: '' }].concat(list);
         }
         const data = list.map(m => {
@@ -250,6 +253,10 @@ function blacklistModel(modelId) {
         BLACKLISTED_MODELS.add(modelId);
         saveBlacklist(BLACKLISTED_MODELS);
         console.warn('[Proxy] Blacklisted model:', modelId);
+        // Rewrite the catalog so the desktop picker / CLI `/model` stop
+        // offering the blacklisted model immediately (they read the catalog
+        // file on disk, not the in-memory list).
+        writeModelCatalog();
     }
 }
 
@@ -352,46 +359,6 @@ function getCurrentModelFromFile() {
     } catch (e) {
         return null;
     }
-}
-
-function switchModel(modelId) {
-    if (!modelId || typeof modelId !== 'string') return { ok: false, error: 'Invalid model ID' };
-
-    currentModel = modelId;
-    log('Hot-switched model to:', modelId);
-
-    try {
-        fs.writeFileSync(MODEL_STATE_PATH, JSON.stringify({ model: modelId }), 'utf-8');
-    } catch (e) {
-        log('State file write failed (non-fatal):', e.message);
-    }
-
-    try {
-        let content = fs.readFileSync(CONFIG_PATH, 'utf-8');
-        content = content.replace(/^model\s*=\s*"[^"]*"/m, 'model = "' + modelId + '"');
-
-        const isThinking = modelId.includes('thinking') || modelId.includes('deepseek-v4-pro') || modelId.includes('kimi-k2');
-        if (isThinking) {
-            if (!content.includes('model_reasoning_effort')) {
-                content = content.replace(/^model\s*=\s*"[^"]*"/m, 'model = "' + modelId + '"\nmodel_reasoning_effort = "high"\nmodel_reasoning_summary = "detailed"\nmodel_supports_reasoning_summaries = true\nshow_raw_agent_reasoning = true');
-            }
-        } else {
-            content = content.replace(/^model_reasoning_effort\s*=\s*.*\n?/gm, '');
-            content = content.replace(/^model_reasoning_summary\s*=\s*.*\n?/gm, '');
-            content = content.replace(/^model_supports_reasoning_summaries\s*=\s*.*\n?/gm, '');
-            content = content.replace(/^show_raw_agent_reasoning\s*=\s*.*\n?/gm, '');
-        }
-
-        fs.writeFileSync(CONFIG_PATH, content, 'utf-8');
-    } catch (e) {
-        log('Config write failed (non-fatal):', e.message);
-    }
-
-    // Keep the catalog in sync with the switched model — otherwise Codex can't
-    // find a matching slug and silently drops tools.
-    writeModelCatalog(MODELS.length > 0 ? MODELS : BUILTIN_MODELS);
-
-    return { ok: true, model: modelId };
 }
 
 function generateTags(modelId, ownedBy) {
@@ -508,150 +475,6 @@ function fetchNvidiaModels() {
         req.end();
     });
 }
-
-const UI_HTML = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Codex NIM Model Switcher</title>
-<style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #c9d1d9; min-height: 100vh; }
-.header { background: #161b22; border-bottom: 1px solid #30363d; padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
-.header h1 { font-size: 18px; font-weight: 600; color: #58a6ff; }
-.header .status { font-size: 12px; color: #8b949e; }
-.header .status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
-.header .status .dot.online { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
-.container { max-width: 900px; margin: 0 auto; padding: 24px; }
-.current { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; margin-bottom: 24px; display: flex; align-items: center; gap: 12px; }
-.current .badge { background: #1f6feb; color: #fff; font-size: 11px; padding: 3px 8px; border-radius: 12px; font-weight: 600; white-space: nowrap; }
-.current .name { font-size: 16px; font-weight: 600; flex: 1; }
-.current .id { font-size: 12px; color: #8b949e; font-family: monospace; }
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
-.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; cursor: pointer; transition: all 0.15s; position: relative; }
-.card:hover { border-color: #58a6ff; background: #1c2129; }
-.card.active { border-color: #3fb950; background: #0d1b11; }
-.card.active::after { content: '✓ ACTIVE'; position: absolute; top: 8px; right: 12px; font-size: 10px; color: #3fb950; font-weight: 700; }
-.card .card-name { font-size: 15px; font-weight: 600; margin-bottom: 6px; }
-.card .card-desc { font-size: 12px; color: #8b949e; margin-bottom: 10px; line-height: 1.5; }
-.card .tags { display: flex; gap: 6px; flex-wrap: wrap; }
-.tag { font-size: 10px; padding: 2px 8px; border-radius: 10px; background: #21262d; color: #8b949e; border: 1px solid #30363d; }
-.tag.coding { color: #7ee787; border-color: #238636; background: #0d1b11; }
-.tag.reasoning { color: #d2a8ff; border-color: #8250df; background: #1b1124; }
-.tag.agent { color: #79c0ff; border-color: #1f6feb; background: #0d1b2a; }
-.tag.fast { color: #f0883e; border-color: #9e6a03; background: #1b180d; }
-.tag.thinking { color: #ff7b72; border-color: #da3633; background: #1b0d0d; }
-.tag.general { color: #c9d1d9; border-color: #484f58; background: #1c2128; }
-.tag.embed { color: #d2a8ff; border-color: #8250df; background: #1b1124; }
-.tag.guard { color: #f0883e; border-color: #9e6a03; background: #1b180d; }
-.toast { position: fixed; bottom: 24px; right: 24px; background: #238636; color: #fff; padding: 12px 20px; border-radius: 8px; font-size: 14px; font-weight: 500; opacity: 0; transform: translateY(10px); transition: all 0.3s; pointer-events: none; z-index: 100; }
-.toast.show { opacity: 1; transform: translateY(0); }
-.toast.error { background: #da3633; }
-.search { width: 100%; padding: 10px 16px; background: #0d1117; border: 1px solid #30363d; border-radius: 8px; color: #c9d1d9; font-size: 14px; margin-bottom: 16px; outline: none; }
-.search:focus { border-color: #58a6ff; }
-.search::placeholder { color: #484f58; }
-</style>
-</head>
-<body>
-<div class="header">
-    <h1>⚡ Codex NIM Switcher</h1>
-    <div class="status"><span class="dot online"></span>Proxy running on :15721</div>
-</div>
-<div class="container">
-    <div class="current" id="currentBar">
-        <span class="badge">CURRENT</span>
-        <span class="name" id="currentName">Loading...</span>
-        <span class="id" id="currentId"></span>
-    </div>
-    <input class="search" type="text" placeholder="🔍 Filter models..." id="search" oninput="render()">
-    <div class="grid" id="grid"></div>
-</div>
-<div class="toast" id="toast"></div>
-<script>
-let models = [];
-let currentModel = '';
-
-async function load() {
-    let data;
-    try {
-        const res = await fetch('/api/models/fetch');
-        data = await res.json();
-        if (!data.live) console.warn('Live fetch failed, using static list:', data.error);
-    } catch (e) {
-        const res = await fetch('/api/models');
-        data = await res.json();
-    }
-    models = data.models;
-    currentModel = data.current;
-    document.getElementById('currentName').textContent = models.find(m => m.id === currentModel)?.name || currentModel;
-    document.getElementById('currentId').textContent = currentModel;
-    render();
-}
-
-function render() {
-    const q = document.getElementById('search').value.toLowerCase();
-    const filtered = models.filter(m => {
-        if (!q) return true;
-        return m.name.toLowerCase().includes(q) || m.id.toLowerCase().includes(q) || m.tags.some(t => t.includes(q));
-    });
-    document.getElementById('grid').innerHTML = filtered.map(m => \`
-        <div class="card \${m.id === currentModel ? 'active' : ''}" onclick="switchTo('\${m.id}')">
-            <div class="card-name">\${m.name}</div>
-            <div class="card-desc">\${m.desc}</div>
-            <div class="tags">\${m.tags.map(t => '<span class="tag '+t+'">'+t+'</span>').join('')}</div>
-        </div>
-    \`).join('');
-}
-
-async function switchTo(modelId) {
-    if (modelId === currentModel) return;
-    try {
-        const res = await fetch('/api/switch', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: modelId })
-        });
-        const data = await res.json();
-        if (data.ok) {
-            currentModel = modelId;
-            document.getElementById('currentName').textContent = models.find(m => m.id === currentModel)?.name || currentModel;
-            document.getElementById('currentId').textContent = currentModel;
-            render();
-            showToast('✓ Switched to ' + models.find(m => m.id === modelId)?.name + ' — takes effect immediately');
-        } else {
-            showToast(data.error || 'Switch failed', true);
-        }
-    } catch (e) {
-        showToast('Network error: ' + e.message, true);
-    }
-}
-
-function showToast(msg, isError) {
-    const t = document.getElementById('toast');
-    t.textContent = msg;
-    t.className = 'toast show' + (isError ? ' error' : '');
-    setTimeout(() => t.className = 'toast', 2500);
-}
-
-// Poll model list periodically so blacklisted models disappear without manual refresh
-setInterval(async () => {
-    try {
-        const res = await fetch('/api/models');
-        const data = await res.json();
-        const before = models.map(m => m.id).join(',');
-        const after = data.models.map(m => m.id).join(',');
-        if (before !== after) {
-            models = data.models;
-            render();
-        }
-    } catch (e) { /* ignore poll errors */ }
-}, 10000);
-
-load();
-</script>
-</body>
-</html>`;
 
 function convertRequest(responsesBody) {
     const chatBody = { ...responsesBody };
@@ -1160,20 +983,36 @@ async function resolveHostedResponseStreaming(res, chatBody) {
     }));
     await new Promise(r => setTimeout(r, 100));
 
+    const heartbeat = setInterval(() => {
+        try {
+            if (res.writable && !res.destroyed) {
+                res.write(': heartbeat\n\n');
+            }
+        } catch (e) {}
+    }, 3000);
+
     const workingChatBody = JSON.parse(JSON.stringify(chatBody));
     workingChatBody.stream = true;
     workingChatBody.messages = Array.isArray(workingChatBody.messages) ? workingChatBody.messages : [];
 
-    const firstRoundResult = await streamSingleRound(res, workingChatBody, tempState, 0);
+    let firstRoundResult;
+    try {
+        firstRoundResult = await streamSingleRound(res, workingChatBody, tempState, 0);
+    } catch (e) {
+        clearInterval(heartbeat);
+        throw e;
+    }
     log('STREAM_MAIN: firstRoundResult=' + (firstRoundResult ? ('wsCalls=' + firstRoundResult.webSearchCalls.length + ', seEvents=' + firstRoundResult.searchEvents.length) : 'null'));
     if (!firstRoundResult) {
         log('STREAM_MAIN: first round returned null (external tool calls), finishing');
+        clearInterval(heartbeat);
         await finishSseIfOpen(res);
         return;
     }
 
     if (firstRoundResult.webSearchCalls.length === 0) {
         log('STREAM_MAIN: no web search calls, finishing. contentItemAdded was in streamSingleRound');
+        clearInterval(heartbeat);
         await finishSseIfOpen(res);
         return;
     }
@@ -1184,14 +1023,6 @@ async function resolveHostedResponseStreaming(res, chatBody) {
     const savedRP = tempState.reasoningParts.length;
     const savedSE = tempState.searchEvents.length;
     const savedAT = tempState.answerText;
-
-    const heartbeat = setInterval(() => {
-        try {
-            if (res.writable && !res.destroyed) {
-                res.write(': heartbeat\n\n');
-            }
-        } catch (e) {}
-    }, 3000);
 
     let fallbackResult;
     try {
@@ -1351,6 +1182,96 @@ function finishSseIfOpen(res) {
     if (res && !res.writableEnded) {
         try { res.end(); } catch (e) {}
     }
+}
+
+// Build a Responses-API JSON object whose single message carries the given
+// text. Used to surface proxy-side errors (e.g. blacklisted/404 model) to the
+// non-streaming client as a normal assistant message instead of an opaque 500.
+function buildMessageResponseObject(responseId, text) {
+    return {
+        id: responseId,
+        object: 'response',
+        status: 'completed',
+        output: [{
+            type: 'message',
+            id: responseId + '_msg',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ type: 'output_text', text }]
+        }]
+    };
+}
+
+// Emit a standard Responses streaming event sequence that renders `text` as a
+// single assistant message, then completes the stream. With `skipHeader`, the
+// caller has already written `response.created` / `response.in_progress` (e.g.
+// mid-stream errors), so we only append the message + completion events.
+async function emitAssistantTextAndComplete(res, responseId, text, skipHeader) {
+    let seq = 0;
+    if (!skipHeader) {
+        await writeSseLine(res, JSON.stringify({
+            type: 'response.created',
+            response: { id: responseId, status: 'in_progress', output: [] },
+            sequence_number: seq++
+        }));
+        await writeSseLine(res, JSON.stringify({
+            type: 'response.in_progress',
+            response: { id: responseId, status: 'in_progress', output: [] },
+            sequence_number: seq++
+        }));
+    }
+    const itemId = responseId + '_msg';
+    await writeSseLine(res, JSON.stringify({
+        type: 'response.output_item.added',
+        item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
+        output_index: 0,
+        sequence_number: seq++
+    }));
+    await writeSseLine(res, JSON.stringify({
+        type: 'response.content_part.added',
+        part: { id: itemId + '_part0', type: 'output_text', text: '' },
+        item_id: itemId,
+        output_index: 0,
+        content_index: 0,
+        sequence_number: seq++
+    }));
+    await writeSseLine(res, JSON.stringify({
+        type: 'response.output_text.delta',
+        delta: text,
+        item_id: itemId,
+        output_index: 0,
+        content_index: 0,
+        sequence_number: seq++
+    }));
+    await writeSseLine(res, JSON.stringify({
+        type: 'response.output_text.done',
+        text,
+        item_id: itemId,
+        output_index: 0,
+        content_index: 0,
+        sequence_number: seq++
+    }));
+    await writeSseLine(res, JSON.stringify({
+        type: 'response.content_part.done',
+        part: { id: itemId + '_part0', type: 'output_text', text },
+        item_id: itemId,
+        output_index: 0,
+        content_index: 0,
+        sequence_number: seq++
+    }));
+    await writeSseLine(res, JSON.stringify({
+        type: 'response.output_item.done',
+        item: { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] },
+        output_index: 0,
+        sequence_number: seq++
+    }));
+    await writeSseLine(res, JSON.stringify({
+        type: 'response.completed',
+        response: { id: responseId, status: 'completed', output: [] },
+        sequence_number: seq++
+    }));
+    await new Promise((r, rj) => res.write('data: [DONE]\n\n', e => e ? rj(e) : r()));
+    try { res.end(); } catch (e) {}
 }
 
 async function resolveHostedResponseCore(chatBody, sharedState, startRound) {
@@ -2116,53 +2037,6 @@ function buildNonStreamResponse(chatResp) {
 }
 
 const proxyServer = http.createServer(async (req, res) => {
-    if (req.method === 'GET' && req.url === '/ui') {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(UI_HTML);
-        return;
-    }
-
-    if (req.method === 'GET' && req.url === '/api/models') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        const filtered = MODELS.filter(m => !BLACKLISTED_MODELS.has(m.id));
-        res.end(JSON.stringify({ current: currentModel, models: filtered }));
-        return;
-    }
-
-    if (req.method === 'GET' && req.url === '/api/models/fetch') {
-        // Clear blacklist on refresh — re-test previously blocked models
-        BLACKLISTED_MODELS.clear();
-        saveBlacklist(BLACKLISTED_MODELS);
-        fetchNvidiaModels().then(models => {
-            MODELS = models.filter(m => !BLACKLISTED_MODELS.has(m.id));
-            writeModelCatalog(MODELS);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ current: currentModel, models: MODELS, live: true }));
-        }).catch(e => {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            const filtered = MODELS.filter(m => !BLACKLISTED_MODELS.has(m.id));
-            res.end(JSON.stringify({ current: currentModel, models: filtered, live: false, error: e.message }));
-        });
-        return;
-    }
-
-    if (req.method === 'POST' && req.url === '/api/switch') {
-        let body = '';
-        req.on('data', chunk => body += chunk);
-        req.on('end', () => {
-            try {
-                const { model } = JSON.parse(body);
-                const result = switchModel(model);
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify(result));
-            } catch (e) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ ok: false, error: e.message }));
-            }
-        });
-        return;
-    }
-
     if (req.method === 'POST' && req.url === '/v1/responses') {
         let body = '';
         req.on('data', chunk => body += chunk);
@@ -2241,8 +2115,39 @@ const proxyServer = http.createServer(async (req, res) => {
 
                 const isStream = responsesBody.stream === true;
 
+                // Pre-flight: a blacklisted model can never succeed — NIM already
+                // returned 404 for it before. Answer with a clear message instead
+                // of round-tripping to NIM and waiting for another 404.
+                if (BLACKLISTED_MODELS.has(chatBody.model)) {
+                    const errText = 'Model "' + chatBody.model + '" is not available (it was previously blacklisted). Switch to a different model.';
+                    log('Pre-flight blacklist rejection:', chatBody.model);
+                    if (isStream) {
+                        res.writeHead(200, {
+                            'Content-Type': 'text/event-stream',
+                            'Cache-Control': 'no-cache',
+                            'Connection': 'keep-alive'
+                        });
+                        if (res.socket) res.socket.setNoDelay(true);
+                        await emitAssistantTextAndComplete(res, 'resp_blacklisted_' + Date.now(), errText, false);
+                    } else {
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify(buildMessageResponseObject('resp_blacklisted_' + Date.now(), errText)));
+                    }
+                    return;
+                }
+
                 if (!isStream) {
-                    const resp = await resolveHostedResponse(chatBody);
+                    let resp;
+                    try {
+                        resp = await resolveHostedResponse(chatBody);
+                    } catch (e) {
+                        const statusCode = e.statusCode || 500;
+                        if (statusCode === 404) blacklistModel(chatBody.model);
+                        const errText = statusCode === 404
+                            ? 'Model "' + chatBody.model + '" is not available on NVIDIA NIM (404). It has been removed from your model list — switch to another model.'
+                            : (statusCode === 500 ? e.message : 'NVIDIA NIM returned ' + statusCode + '. The model may be overloaded. Try again or switch models.');
+                        resp = buildMessageResponseObject('resp_error_' + Date.now(), errText);
+                    }
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify(resp));
                     return;
@@ -2263,24 +2168,18 @@ const proxyServer = http.createServer(async (req, res) => {
                     log('Stream error:', streamErr.message);
                     if (streamErr.body) log('Stream error body:', streamErr.body.substring(0, 500));
                     const statusCode = streamErr.statusCode || 500;
-                    const errEvent = JSON.stringify({
-                        type: 'error',
-                        error: {
-                            type: 'server_error',
-                            code: statusCode === 500 ? 'proxy_error' : ('upstream_' + statusCode),
-                            message: statusCode === 500
-                                ? streamErr.message
-                                : 'NVIDIA NIM returned ' + statusCode + '. The model may be overloaded. Try again or switch models.'
-                        }
-                    });
+                    const isNotFound = statusCode === 404;
+                    const errText = isNotFound
+                        ? 'Model "' + (chatBody.model || '') + '" is not available on NVIDIA NIM (404). It has been removed from your model list — switch to another model.'
+                        : (statusCode === 500
+                            ? streamErr.message
+                            : 'NVIDIA NIM returned ' + statusCode + '. The model may be overloaded. Try again or switch models.');
                     if (!res.writableEnded) {
-                        res.write('data: ' + errEvent + '\n\n');
-                        res.write('data: ' + JSON.stringify({
-                            type: 'response.completed',
-                            response: { id: 'error', status: 'failed', output: [] }
-                        }) + '\n\n');
-                        res.write('data: [DONE]\n\n');
-                        res.end();
+                        // response.created / response.in_progress were already
+                        // written before the stream errored, so append only the
+                        // message + completion events (skipHeader = true). The
+                        // `type: 'error'` event is not rendered by Codex.
+                        await emitAssistantTextAndComplete(res, 'resp_error_' + Date.now(), errText, true);
                     }
                     // Blacklist models that return 404 (not available for this account)
                     if (statusCode === 404) {
