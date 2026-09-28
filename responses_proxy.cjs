@@ -298,28 +298,39 @@ function log(...args) {
 let currentModel = getCurrentModelFromFile();
 
 stripProxyConfig();
-if (currentModel) {
-    writeProxyConfig(currentModel);
-    writeModelCatalog();
-} else {
-    // No saved model — fetch from NIM to get a valid default
-    fetchNvidiaModels().then(models => {
-        currentModel = (models.length > 0) ? models[0].id : (MODELS.length > 0 ? MODELS[0].id : null);
-        if (currentModel) {
-            writeProxyConfig(currentModel);
-            writeModelCatalog(models.length > 0 ? models : null);
-        } else {
-            console.warn('[Proxy] No models available, config not written');
-        }
-    }).catch(e => {
-        console.warn('[Proxy] Failed to fetch models on startup:', e.message);
+
+// Refresh the model list from NIM on every startup so the catalog the desktop
+// picker reads stays current (models.json is only a stale fallback).
+// `currentModel` is the fallback default; a live request's model wins.
+function applyStartupModels(models, live) {
+    if (Array.isArray(models) && models.length > 0) {
+        MODELS = models;
+    }
+    if (!currentModel) {
         currentModel = MODELS.length > 0 ? MODELS[0].id : null;
         if (currentModel) {
-            writeProxyConfig(currentModel);
-            writeModelCatalog();
+            try { fs.writeFileSync(MODEL_STATE_PATH, JSON.stringify({ model: currentModel }), 'utf-8'); } catch (e) {}
         }
-    });
+    } else if (live && !MODELS.some(m => m.id === currentModel)) {
+        // Saved model is no longer offered by NIM; default to the first live
+        // chat model instead of leaving a dead slug in config.toml.
+        currentModel = MODELS.length > 0 ? MODELS[0].id : null;
+        if (currentModel) {
+            try { fs.writeFileSync(MODEL_STATE_PATH, JSON.stringify({ model: currentModel }), 'utf-8'); } catch (e) {}
+        }
+    }
+    if (currentModel) {
+        writeProxyConfig(currentModel);
+    }
+    writeModelCatalog();
 }
+
+fetchNvidiaModels()
+    .then(models => applyStartupModels(models, true))
+    .catch(e => {
+        console.warn('[Proxy] Failed to fetch models on startup:', e.message);
+        applyStartupModels(null, false);
+    });
 
 function getCurrentModelFromFile() {
     try {
@@ -438,6 +449,15 @@ function isMultimodalModel(modelId) {
     return /vision|vl\b|multimodal|omni|image|video|ocr|deplot|kosmos|neva|nvclip|vila|fuyu|paligemma/.test(lower);
 }
 
+// `/v1/models` lists every model the key can access — embeddings, rerankers,
+// guardrails, parsers, translators, and other non-chat models can't be used
+// through the Chat Completions API that Codex talks to. The response has no
+// `type` field, so we drop them with an id-keyword heuristic.
+function isChatModel(id, ownedBy) {
+    const lower = (id || '').toLowerCase();
+    return !/embed|retriev|rerank|guard|safety|shield|pii|nemoguard|content-safety|parse|translate|tts|asr|ocr|detector|calibration|reward|cosmos|muse-glimmer|diffusiongemma|synthetic-video|ising|chatqa|nvclip|neva|deplot|kosmos|fuyu|paligemma|vila/.test(lower);
+}
+
 function fetchNvidiaModels() {
     return new Promise((resolve, reject) => {
         const options = {
@@ -464,6 +484,7 @@ function fetchNvidiaModels() {
                             seen.add(m.id);
                             return true;
                         })
+                        .filter(m => isChatModel(m.id, m.owned_by))
                         .map(m => ({
                             id: m.id,
                             name: m.id.split('/').pop(),
