@@ -13,7 +13,6 @@ if not exist .env (
 
 echo Starting Codex NIM Proxy...
 echo Proxy  : http://127.0.0.1:15721/v1/responses
-echo UI     : http://127.0.0.1:15721/ui
 echo.
 node responses_proxy.cjs
 pause
