@@ -583,6 +583,16 @@ function convertRequest(responsesBody) {
                     msg.tool_call_id = item.tool_call_id;
                 }
                 messages.push(msg);
+                continue;
+            }
+            // Anything reaching here used to fall through silently, which is how
+            // protocol drift stayed invisible: images started arriving inside
+            // `function_call_output` and the proxy quietly forwarded them in a
+            // shape NIM rejects. `reasoning` items are intentionally not replayed
+            // (NIM regenerates its own), everything else is worth a warning.
+            if (item.type !== 'reasoning') {
+                const kind = item.type || (item.role ? 'role:' + item.role : 'unknown');
+                console.warn('[Proxy] Ignoring unsupported input item [' + kind + ']: ' + JSON.stringify(item).substring(0, 400));
             }
         }
         chatBody.messages = messages;
