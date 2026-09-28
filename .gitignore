@@ -1,6 +1,7 @@
 .env
 model_state.json
 model_blacklist.json
+tool_dump.json
 node_modules/
 .npm-cache-codex/
 *.log

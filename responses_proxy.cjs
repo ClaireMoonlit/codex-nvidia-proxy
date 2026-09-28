@@ -517,9 +517,11 @@ function normalizeContentParts(content) {
     return parts;
 }
 
-// Codex's freeform tool channels (MCP, `apply_patch`) surface as
-// `custom_tool_call` / `custom_tool_call_output` instead of the `function_call`
-// pair, so history replay used to lose the whole exchange. NIM accepts
+// Codex's freeform tool channel — `apply_patch`, the only `custom` tool in the
+// surface — surfaces as `custom_tool_call` / `custom_tool_call_output` instead
+// of the `function_call` pair, so history replay used to lose the whole
+// exchange. (MCP tools are ordinary `function` tools nested in a `namespace`,
+// so they replay as `function_call`.) NIM accepts
 // `tool_calls` entries that reference tools it was never offered, so no
 // declaration is needed. Chat Completions wants `arguments` to be a JSON string,
 // but a custom call carries the raw payload the model produced — anything that
@@ -534,6 +536,88 @@ function toToolArguments(input) {
     } catch (e) {
         return JSON.stringify({ input });
     }
+}
+
+// Debug aid. Codex keeps growing tool types this proxy doesn't know about
+// (`custom`, `namespace`, ...) and each new one silently disappears from the
+// request, so the real shape can only be learned from the client itself. Dump
+// the raw tool surface whenever it changes so it can be inspected directly
+// instead of guessed at (and instead of copying it out of a terminal by hand).
+const TOOL_DUMP_PATH = path.join(__dirname, 'tool_dump.json');
+let lastToolDump = '';
+function dumpToolSurface(tools) {
+    try {
+        const json = JSON.stringify(tools, null, 2);
+        if (json === lastToolDump) return;
+        lastToolDump = json;
+        fs.writeFileSync(TOOL_DUMP_PATH, json + '\n', 'utf-8');
+    } catch (e) {
+        console.warn('[Proxy] Failed to write tool dump:', e.message);
+    }
+}
+
+// Chat Completions only understands flat `function` tools, while Codex groups
+// related tools under a `namespace`: every tool of one MCP server lands under
+// `mcp__<server>`, and the sub-agent tools under `multi_agent_v1`. Lift each
+// sub-tool to the top level and qualify its name with the namespace so it stays
+// unique — `mcp__hello` + `say_hello` becomes `mcp__hello__say_hello`, which is
+// exactly Codex's own `mcp__<server>__<tool>` naming.
+function toChatTool(t) {
+    if (!t || typeof t !== 'object') return null;
+    if (t.type === 'function') {
+        const { type, ...rest } = t;
+        return { type: 'function', function: { ...(t.function || rest) } };
+    }
+    if (t.type === 'web_search_preview' || t.type === 'web_search') {
+        return {
+            type: 'function',
+            function: {
+                name: 'web_search',
+                description: 'Search the web for public internet information. Prefer this over shell, curl, wget, Invoke-WebRequest, Python requests, or browser scraping when answering weather, news, prices, sports, travel, or other real-time web questions.',
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        searchTerm: { type: 'string', description: 'The search query' }
+                    },
+                    required: ['searchTerm']
+                }
+            }
+        };
+    }
+    // `custom` (e.g. `apply_patch`) is freeform and carries no JSON schema, so
+    // it has no Chat Completions equivalent.
+    return null;
+}
+
+function expandToolList(tools) {
+    const expanded = [];
+    const drop = (t) => {
+        log('Warning: dropped unsupported tool type:', t && t.type);
+        log('DROPPED TOOL FULL:', JSON.stringify(t).substring(0, 4000));
+    };
+    for (const t of tools) {
+        if (t && t.type === 'namespace' && Array.isArray(t.tools)) {
+            for (const sub of t.tools) {
+                const converted = toChatTool(sub);
+                if (!converted) {
+                    drop(sub);
+                    continue;
+                }
+                if (sub.type === 'function') {
+                    converted.function.name = t.name + '__' + converted.function.name;
+                }
+                expanded.push(converted);
+            }
+            continue;
+        }
+        const converted = toChatTool(t);
+        if (!converted) {
+            drop(t);
+            continue;
+        }
+        expanded.push(converted);
+    }
+    return expanded;
 }
 
 function convertRequest(responsesBody) {
@@ -646,34 +730,8 @@ function convertRequest(responsesBody) {
     }
 
     if (chatBody.tools && Array.isArray(chatBody.tools)) {
-        chatBody.tools = chatBody.tools
-            .map(t => {
-                if (t.type === 'function') {
-                    if (t.function) return t;
-                    const { type, ...rest } = t;
-                    return { type: 'function', function: rest };
-                }
-                if (t.type === 'web_search_preview' || t.type === 'web_search') {
-                    return {
-                        type: 'function',
-                        function: {
-                            name: 'web_search',
-                            description: 'Search the web for public internet information. Prefer this over shell, curl, wget, Invoke-WebRequest, Python requests, or browser scraping when answering weather, news, prices, sports, travel, or other real-time web questions.',
-                            parameters: {
-                                type: 'object',
-                                properties: {
-                                    searchTerm: { type: 'string', description: 'The search query' }
-                                },
-                                required: ['searchTerm']
-                            }
-                        }
-                    };
-                }
-                log('Warning: dropped unsupported tool type:', t.type);
-                log('DROPPED TOOL FULL:', JSON.stringify(t).substring(0, 4000));
-                return null;
-            })
-            .filter(Boolean);
+        dumpToolSurface(chatBody.tools);
+        chatBody.tools = expandToolList(chatBody.tools);
         if (chatBody.tools && chatBody.tools.length > 0) {
             chatBody.tool_choice = 'auto';
         } else {
