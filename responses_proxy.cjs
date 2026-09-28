@@ -299,28 +299,32 @@ let currentModel = getCurrentModelFromFile();
 
 stripProxyConfig();
 
-// Refresh the model list from NIM on every startup so the catalog the desktop
-// picker reads stays current (models.json is only a stale fallback).
-// `currentModel` is the fallback default; a live request's model wins.
+// Write the proxy config synchronously right after stripping so config.toml
+// is never left provider-less (a concurrently starting Codex could otherwise
+// read an empty config during the async fetch window below).
+if (!currentModel && MODELS.length > 0) {
+    currentModel = MODELS[0].id;
+}
+if (currentModel) {
+    writeProxyConfig(currentModel);
+}
+
+// Refresh the model list from NIM on every startup so the catalog that feeds
+// both the desktop picker and the CLI `/model` command stays current
+// (models.json is only a stale fallback). A stale saved model is corrected
+// here; a failed fetch never clobbers the saved choice.
 function applyStartupModels(models, live) {
     if (Array.isArray(models) && models.length > 0) {
         MODELS = models;
     }
-    if (!currentModel) {
-        currentModel = MODELS.length > 0 ? MODELS[0].id : null;
-        if (currentModel) {
-            try { fs.writeFileSync(MODEL_STATE_PATH, JSON.stringify({ model: currentModel }), 'utf-8'); } catch (e) {}
-        }
-    } else if (live && !MODELS.some(m => m.id === currentModel)) {
+    if (live && (!currentModel || !MODELS.some(m => m.id === currentModel))) {
         // Saved model is no longer offered by NIM; default to the first live
         // chat model instead of leaving a dead slug in config.toml.
         currentModel = MODELS.length > 0 ? MODELS[0].id : null;
         if (currentModel) {
             try { fs.writeFileSync(MODEL_STATE_PATH, JSON.stringify({ model: currentModel }), 'utf-8'); } catch (e) {}
+            writeProxyConfig(currentModel);
         }
-    }
-    if (currentModel) {
-        writeProxyConfig(currentModel);
     }
     writeModelCatalog();
 }
@@ -329,7 +333,7 @@ fetchNvidiaModels()
     .then(models => applyStartupModels(models, true))
     .catch(e => {
         console.warn('[Proxy] Failed to fetch models on startup:', e.message);
-        applyStartupModels(null, false);
+        writeModelCatalog();
     });
 
 function getCurrentModelFromFile() {
