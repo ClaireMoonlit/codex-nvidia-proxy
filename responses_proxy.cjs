@@ -486,6 +486,37 @@ function fetchNvidiaModels() {
     });
 }
 
+// Codex sends rich content as an array of parts using its own type names
+// (`input_text` / `input_image` / `output_image`), while Chat Completions wants
+// `text` / `image_url`. Forwarding the Codex names verbatim makes NIM reject the
+// whole request — "data did not match any variant of untagged enum
+// ChatCompletionRequestToolMessageContent" — which is what happened to
+// `view_image` results that came back as `function_call_output` with an
+// `input_image` part.
+function normalizeContentParts(content) {
+    const textParts = [];
+    const imageParts = [];
+    for (const c of content) {
+        if (c.type === 'input_text' || c.type === 'output_text') {
+            textParts.push(c.text);
+        } else if (c.type === 'input_image' || c.type === 'output_image') {
+            const imgUrl = c.image_url || (c.source && c.source.url) || '';
+            if (imgUrl) {
+                imageParts.push({ type: 'image_url', image_url: { url: imgUrl } });
+            }
+        }
+    }
+    if (imageParts.length === 0) {
+        return textParts.join('');
+    }
+    const parts = [];
+    if (textParts.length > 0) {
+        parts.push({ type: 'text', text: textParts.join('') });
+    }
+    parts.push(...imageParts);
+    return parts;
+}
+
 function convertRequest(responsesBody) {
     const chatBody = { ...responsesBody };
     if (DEBUG) {
@@ -515,10 +546,16 @@ function convertRequest(responsesBody) {
                 continue;
             }
             if (item.type === 'function_call_output') {
+                let output = item.output;
+                if (Array.isArray(output)) {
+                    output = normalizeContentParts(output);
+                } else if (output && typeof output === 'object') {
+                    output = JSON.stringify(output);
+                }
                 messages.push({
                     role: 'tool',
                     tool_call_id: item.call_id,
-                    content: item.output || ''
+                    content: output || ''
                 });
                 continue;
             }
@@ -537,33 +574,7 @@ function convertRequest(responsesBody) {
                 if (typeof item.content === 'string') {
                     msg.content = item.content;
                 } else if (Array.isArray(item.content)) {
-                    const textParts = [];
-                    const imageParts = [];
-                    for (const c of item.content) {
-                        if (c.type === 'input_text' || c.type === 'output_text') {
-                            textParts.push(c.text);
-                        } else if (c.type === 'input_image') {
-                            const imgUrl = c.image_url || (c.source && c.source.url) || '';
-                            if (imgUrl) {
-                                imageParts.push({ type: 'image_url', image_url: { url: imgUrl } });
-                            }
-                        } else if (c.type === 'output_image') {
-                            const imgUrl = c.image_url || (c.source && c.source.url) || '';
-                            if (imgUrl) {
-                                imageParts.push({ type: 'image_url', image_url: { url: imgUrl } });
-                            }
-                        }
-                    }
-                    if (imageParts.length === 0) {
-                        msg.content = textParts.join('');
-                    } else {
-                        const parts = [];
-                        if (textParts.length > 0) {
-                            parts.push({ type: 'text', text: textParts.join('') });
-                        }
-                        parts.push(...imageParts);
-                        msg.content = parts;
-                    }
+                    msg.content = normalizeContentParts(item.content);
                 }
                 if (item.tool_calls) {
                     msg.tool_calls = item.tool_calls;
