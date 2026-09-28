@@ -29,11 +29,11 @@ const path = require('path');
 const NVIDIA_HOST = 'integrate.api.nvidia.com';
 const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY;
 const PROXY_PORT = 15721;
-const CONFIG_PATH = path.join(process.env.USERPROFILE || '~', '.codex', 'config.toml');
+const CONFIG_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '~', '.codex', 'config.toml');
 const MODEL_STATE_PATH = path.join(__dirname, 'model_state.json');
 const MODEL_LIST_PATH = path.join(__dirname, 'models.json');
 const MODEL_BLACKLIST_PATH = path.join(__dirname, 'model_blacklist.json');
-const MODEL_CATALOG_PATH = path.join(process.env.USERPROFILE || '~', '.codex', 'model-catalog.json');
+const MODEL_CATALOG_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '~', '.codex', 'model-catalog.json');
 const DEBUG = (process.env.DEBUG || '').toLowerCase() === 'true';
 
 const PROXY_API_BASE = 'http://127.0.0.1:15721/v1';
@@ -2166,9 +2166,9 @@ const proxyServer = http.createServer(async (req, res) => {
             try {
                 const responsesBody = JSON.parse(body);
                 const chatBody = convertRequest(responsesBody);
-                chatBody.model = currentModel;
+                chatBody.model = chatBody.model || currentModel;
 
-                if (!isMultimodalModel(currentModel) && Array.isArray(chatBody.messages)) {
+                if (!isMultimodalModel(chatBody.model) && Array.isArray(chatBody.messages)) {
                     let imagesStripped = 0;
                     for (const msg of chatBody.messages) {
                         if (Array.isArray(msg.content)) {
@@ -2184,12 +2184,12 @@ const proxyServer = http.createServer(async (req, res) => {
                         }
                     }
                     if (imagesStripped > 0) {
-                        log('Warning: stripped ' + imagesStripped + ' image(s) from request (model ' + currentModel + ' does not support multimodal)');
+                        log('Warning: stripped ' + imagesStripped + ' image(s) from request (model ' + chatBody.model + ' does not support multimodal)');
                     }
                 }
 
-                if (isMultimodalModel(currentModel) && Array.isArray(chatBody.messages)) {
-                    const maxImages = /llama.*vision/.test(currentModel.toLowerCase()) ? 1 : 1;
+                if (isMultimodalModel(chatBody.model) && Array.isArray(chatBody.messages)) {
+                    const maxImages = /llama.*vision/.test(chatBody.model.toLowerCase()) ? 1 : 1;
                     const imageMessages = [];
                     for (let i = 0; i < chatBody.messages.length; i++) {
                         const msg = chatBody.messages[i];
