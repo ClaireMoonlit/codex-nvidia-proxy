@@ -589,6 +589,19 @@ function toChatTool(t) {
     return null;
 }
 
+// Codex resolves a tool call through the `(namespace, name)` pair its router
+// builds (`ToolName::new(namespace, name)`), and a tool grouped under a
+// `namespace` only matches when that namespace comes back with it. Chat
+// Completions has no such field, so remember how each flattened name maps back
+// and split it apart again on the way out.
+const NAMESPACED_TOOLS = new Map();
+function toolNameFields(flatName) {
+    const original = NAMESPACED_TOOLS.get(flatName);
+    return original
+        ? { name: original.name, namespace: original.namespace }
+        : { name: flatName };
+}
+
 function expandToolList(tools) {
     const expanded = [];
     const drop = (t) => {
@@ -604,7 +617,9 @@ function expandToolList(tools) {
                     continue;
                 }
                 if (sub.type === 'function') {
-                    converted.function.name = t.name + '__' + converted.function.name;
+                    const flat = t.name + '__' + converted.function.name;
+                    NAMESPACED_TOOLS.set(flat, { namespace: t.name, name: converted.function.name });
+                    converted.function.name = flat;
                 }
                 expanded.push(converted);
             }
@@ -641,7 +656,12 @@ function convertRequest(responsesBody) {
                         id: item.call_id || item.id || '',
                         type: 'function',
                         function: {
-                            name: item.name || '',
+                            // Codex hands a namespaced call back as `namespace`
+                            // plus a bare `name`, but NIM only ever saw the
+                            // flattened form that expandToolList declared.
+                            name: item.namespace && item.name
+                                ? item.namespace + '__' + item.name
+                                : (item.name || ''),
                             // `function_call` carries a JSON argument string, while
                             // `custom_tool_call` carries the freeform payload the
                             // model produced (e.g. a raw patch).
@@ -1022,7 +1042,7 @@ function buildResponseObjectFromState(state) {
             type: 'function_call',
             id: responseId + '_fc_' + (tc.index || 0),
             call_id: tc.id || '',
-            name: tc.name || '',
+            ...toolNameFields(tc.name || ''),
             arguments: tc.arguments || '',
             status: 'completed'
         });
@@ -1284,7 +1304,7 @@ async function resolveHostedResponseStreaming(res, chatBody) {
             const itemId = tempState.responseId + '_fc_post_' + (tc.index || i);
             await writeSseLine(res, JSON.stringify({
                 type: 'response.output_item.added',
-                item: { id: itemId, type: 'function_call', name: tc.name, call_id: tc.id, arguments: tc.arguments, status: 'in_progress' },
+                item: { id: itemId, type: 'function_call', ...toolNameFields(tc.name), call_id: tc.id, arguments: tc.arguments, status: 'in_progress' },
                 output_index: fcIdx,
                 sequence_number: tempState.seq++
             }));
@@ -1297,7 +1317,7 @@ async function resolveHostedResponseStreaming(res, chatBody) {
             }));
             await writeSseLine(res, JSON.stringify({
                 type: 'response.output_item.done',
-                item: { id: itemId, type: 'function_call', name: tc.name, call_id: tc.id, arguments: tc.arguments, status: 'completed' },
+                item: { id: itemId, type: 'function_call', ...toolNameFields(tc.name), call_id: tc.id, arguments: tc.arguments, status: 'completed' },
                 output_index: fcIdx,
                 sequence_number: tempState.seq++
             }));
@@ -1757,7 +1777,7 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
             const itemId = state.responseId + '_fc_r' + roundIndex + '_' + tc.index;
             await writeSseLine(res, JSON.stringify({
                 type: 'response.output_item.added',
-                item: { id: itemId, type: 'function_call', name: tc.name, call_id: tc.id, arguments: tc.arguments, status: 'in_progress' },
+                item: { id: itemId, type: 'function_call', ...toolNameFields(tc.name), call_id: tc.id, arguments: tc.arguments, status: 'in_progress' },
                 output_index: fcIndex,
                 sequence_number: state.seq++
             }));
@@ -1770,7 +1790,7 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
             }));
             await writeSseLine(res, JSON.stringify({
                 type: 'response.output_item.done',
-                item: { id: itemId, type: 'function_call', name: tc.name, call_id: tc.id, arguments: tc.arguments, status: 'completed' },
+                item: { id: itemId, type: 'function_call', ...toolNameFields(tc.name), call_id: tc.id, arguments: tc.arguments, status: 'completed' },
                 output_index: fcIndex,
                 sequence_number: state.seq++
             }));
@@ -2009,7 +2029,7 @@ async function streamResponseObject(res, responseObject, skipHeader) {
                 item: {
                     id: item.id,
                     type: 'function_call',
-                    name: item.name,
+                    ...toolNameFields(item.name),
                     call_id: item.call_id,
                     arguments: '',
                     status: 'in_progress'
@@ -2168,7 +2188,7 @@ function buildNonStreamResponse(chatResp) {
             type: 'function_call',
             id: (chatResp.id || 'resp_proxy') + '_fc_' + (tc.index || 0),
             call_id: tc.id || '',
-            name: fn.name || '',
+            ...toolNameFields(fn.name || ''),
             arguments: fn.arguments || '',
             status: 'completed'
         });
