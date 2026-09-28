@@ -517,6 +517,25 @@ function normalizeContentParts(content) {
     return parts;
 }
 
+// Codex's freeform tool channels (MCP, `apply_patch`) surface as
+// `custom_tool_call` / `custom_tool_call_output` instead of the `function_call`
+// pair, so history replay used to lose the whole exchange. NIM accepts
+// `tool_calls` entries that reference tools it was never offered, so no
+// declaration is needed. Chat Completions wants `arguments` to be a JSON string,
+// but a custom call carries the raw payload the model produced — anything that
+// isn't already JSON gets wrapped instead of passed through raw.
+function toToolArguments(input) {
+    if (typeof input !== 'string') {
+        return JSON.stringify(input == null ? {} : input);
+    }
+    try {
+        JSON.parse(input);
+        return input;
+    } catch (e) {
+        return JSON.stringify({ input });
+    }
+}
+
 function convertRequest(responsesBody) {
     const chatBody = { ...responsesBody };
     if (DEBUG) {
@@ -530,7 +549,7 @@ function convertRequest(responsesBody) {
     if (chatBody.input && Array.isArray(chatBody.input)) {
         const messages = [];
         for (const item of chatBody.input) {
-            if (item.type === 'function_call') {
+            if (item.type === 'function_call' || item.type === 'custom_tool_call') {
                 messages.push({
                     role: 'assistant',
                     content: null,
@@ -539,13 +558,18 @@ function convertRequest(responsesBody) {
                         type: 'function',
                         function: {
                             name: item.name || '',
-                            arguments: item.arguments || '{}'
+                            // `function_call` carries a JSON argument string, while
+                            // `custom_tool_call` carries the freeform payload the
+                            // model produced (e.g. a raw patch).
+                            arguments: item.type === 'function_call'
+                                ? (item.arguments || '{}')
+                                : toToolArguments(item.input)
                         }
                     }]
                 });
                 continue;
             }
-            if (item.type === 'function_call_output') {
+            if (item.type === 'function_call_output' || item.type === 'custom_tool_call_output') {
                 let output = item.output;
                 if (Array.isArray(output)) {
                     output = normalizeContentParts(output);
