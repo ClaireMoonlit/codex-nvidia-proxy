@@ -417,10 +417,12 @@ function modelSortKey(model) {
 // `integrate.api.nvidia.com` exposes no modality metadata: `/v1/models`,
 // `/v1/models?verbose=true` and `/v1/models/{id}` all return only
 // id/object/created/owned_by. Capability therefore has to be inferred from the
-// model id. This single predicate drives both the catalog's `input_modalities`
-// (which gates the desktop "attach image" button) and image handling in outgoing
-// requests — they must agree, otherwise the client accepts an image the proxy
-// then silently strips.
+// model id — glm-5.3 is listed here because NIM accepts image content for
+// `z-ai/glm-5.3-flash` (checked: an image-bearing chat/completions request
+// returns 200 with content, not an error). This single predicate drives both the
+// catalog's `input_modalities` (which gates the desktop "attach image" button)
+// and image handling in outgoing requests — they must agree, otherwise the client
+// accepts an image the proxy then silently strips.
 const VISION_MODEL_RE = /vision|vl\b|multimodal|omni|glm-5\.3|image|video|ocr|deplot|kosmos|neva|nvclip|vila|fuyu|paligemma/;
 
 function isVisionModel(modelId) {
