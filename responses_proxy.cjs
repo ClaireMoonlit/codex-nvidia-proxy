@@ -38,26 +38,59 @@ const DEBUG = (process.env.DEBUG || '').toLowerCase() === 'true';
 
 const PROXY_API_BASE = 'http://127.0.0.1:15721/v1';
 
+// 顶层由代理负责写入/清理的键（不属于任何 [section]）。
+// 清理时只对这些键动手，绝不改动用户自己定义的其它 provider 段。
+const PROXY_TOP_KEYS = /^(api_base_url|model_provider|model|model_catalog_json|model_reasoning_effort|model_reasoning_summary|model_supports_reasoning_summaries|show_raw_agent_reasoning)\s*=/;
+const PROXY_PROVIDER_SECTION = 'model_providers.nvidia-proxy';
+
+// 从 TOML 内容中移除代理写入的配置：
+// - 整段删除 [model_providers.nvidia-proxy]（含 header 与段内所有键）
+// - 删除顶层（尚未进入任何 [section]）的代理键
+// 其余内容（例如用户自定义的 [model_providers.custom] 等）原样保留，
+// 这样历史线程引用的其它 provider 名不会因代理启动/退出而被破坏。
+function removeProxyConfig(content) {
+    const lines = content.split(/\r?\n/);
+    const out = [];
+    let currentSection = null;
+    for (const line of lines) {
+        const secHeader = line.match(/^\s*\[([^\]]*)\]\s*$/);
+        if (secHeader) {
+            currentSection = secHeader[1].trim();
+            if (currentSection === PROXY_PROVIDER_SECTION) {
+                // 跳过 nvidia-proxy 段 header 及其后所有键
+                continue;
+            }
+            out.push(line);
+            continue;
+        }
+        if (currentSection === PROXY_PROVIDER_SECTION) {
+            // 跳过 nvidia-proxy 段内部所有键
+            continue;
+        }
+        out.push(line);
+    }
+    // 删除顶层代理键（仅在文件开头、任何 [section] 之前出现）
+    const result = [];
+    let inSection = false;
+    for (const line of out) {
+        if (/^\s*\[([^\]]*)\]\s*$/.test(line)) {
+            inSection = true;
+            result.push(line);
+            continue;
+        }
+        if (!inSection && PROXY_TOP_KEYS.test(line)) {
+            continue;
+        }
+        result.push(line);
+    }
+    return result.join('\n');
+}
+
 function stripProxyConfig() {
     try {
         if (!fs.existsSync(CONFIG_PATH)) return;
-        let content = fs.readFileSync(CONFIG_PATH, 'utf-8');
-        const before = content;
-        // Remove old api_base_url format (backward compatible)
-        content = content.replace(/^api_base_url\s*=.*\n?/gm, '');
-        // Remove model_provider-based format
-        content = content.replace(/^model_provider\s*=\s*"[^"]*"\n?/gm, '');
-        content = content.replace(/^\[model_providers\.nvidia-proxy\]\n?/gm, '');
-        content = content.replace(/^name\s*=\s*"NVIDIA NIM Proxy"\n?/gm, '');
-        content = content.replace(/^base_url\s*=\s*"[^"]*"\n?/gm, '');
-        content = content.replace(/^wire_api\s*=\s*"[^"]*"\n?/gm, '');
-        // Remove model catalog
-        content = content.replace(/^model_catalog_json\s*=.*\n?/gm, '');
-        // Remove model line
-        content = content.replace(/^model\s*=\s*"[^"]*"\n?/gm, '');
-        // Remove reasoning settings
-        content = content.replace(/^(model_reasoning_effort|model_reasoning_summary|model_supports_reasoning_summaries|show_raw_agent_reasoning)\s*=.*\n?/gm, '');
-        content = content.trimEnd();
+        const before = fs.readFileSync(CONFIG_PATH, 'utf-8');
+        const content = removeProxyConfig(before).trimEnd();
         if (content !== before.trimEnd()) {
             fs.writeFileSync(CONFIG_PATH, content ? content + '\n' : '', 'utf-8');
         }
@@ -72,19 +105,10 @@ function writeProxyConfig(modelId) {
         if (fs.existsSync(CONFIG_PATH)) {
             content = fs.readFileSync(CONFIG_PATH, 'utf-8');
         }
-        // Remove old proxy formats
-        content = content.replace(/^api_base_url\s*=.*\n?/gm, '');
-        content = content.replace(/^model_provider\s*=\s*"[^"]*"\n?/gm, '');
-        content = content.replace(/^\[model_providers\.nvidia-proxy\]\n?/gm, '');
-        content = content.replace(/^name\s*=\s*"NVIDIA NIM Proxy"\n?/gm, '');
-        content = content.replace(/^base_url\s*=\s*"[^"]*"\n?/gm, '');
-        content = content.replace(/^wire_api\s*=\s*"[^"]*"\n?/gm, '');
-        content = content.replace(/^model\s*=\s*"[^"]*"\n?/gm, '');
-        content = content.trim();
+        // 先移除旧的代理配置，但保留用户自定义的其它 provider 段（如 custom）
+        content = removeProxyConfig(content).trim();
 
-        // Write provider-based config
-        // NOTE: top-level keys (model_provider, model, model_catalog_json) must be
-        // written BEFORE any [section] headers — TOML scope requires it.
+        // 顶层键必须写在任何 [section] header 之前，否则 TOML 作用域会出错
         const providerConfig = 'model_provider = "nvidia-proxy"\n' +
             'model = "' + modelId + '"\n' +
             'model_catalog_json = "model-catalog.json"\n\n' +
@@ -108,30 +132,57 @@ function writeProxyConfig(modelId) {
 
 function writeModelCatalog(models) {
     try {
-        const data = (models || BUILTIN_MODELS).map(m => {
+        // Codex model catalog schema — verified against official provider catalogs
+        // (MiniMax M3, Z.ai GLM, Alibaba Model Studio). Keep the field set minimal:
+        // `model_messages`, `comp_hash`, `use_responses_lite` etc. are NOT required
+        // and adding them pulls in more required sub-fields. Tool execution is gated
+        // by `shell_type`.
+        let list = (models && models.length > 0) ? models : (MODELS.length > 0 ? MODELS : BUILTIN_MODELS);
+        // Ensure the currently-selected model is present, otherwise Codex won't
+        // find a matching slug and silently drops tools.
+        if (currentModel && !list.some(x => x.id === currentModel)) {
+            list = [{ id: currentModel, name: currentModel, desc: '' }].concat(list);
+        }
+        const data = list.map(m => {
             const isThinking = /thinking|deepseek-v4-pro|kimi-k2/.test(m.id);
             const isVision = /vision|multimodal|vl\b|omni/.test(m.id);
             return {
-                id: m.id,
-                object: 'model',
-                created: 1704067200,
-                owned_by: 'nvidia-nim',
-                metadata: {
-                    display_name: m.name,
-                    description: m.desc || '',
-                    context_window: isThinking ? 1048576 : 131072,
-                    input_modalities: isVision ? ['text', 'image'] : ['text'],
-                    supported_reasoning_efforts: isThinking ? ['high', 'medium', 'low'] : [],
-                    supports_reasoning_summaries: isThinking,
-                    default_reasoning_effort: isThinking ? 'high' : null,
-                    prefer_websockets: false,
-                    supports_parallel_tool_calls: true,
-                    supported_in_api: true,
-                    priority: 100
-                }
+                slug: m.id,
+                display_name: m.name,
+                description: m.desc || m.name,
+                default_reasoning_level: isThinking ? 'high' : 'low',
+                supported_reasoning_levels: isThinking
+                    ? [
+                        { effort: 'low', description: 'Fast responses with lighter reasoning' },
+                        { effort: 'medium', description: 'Balances speed and reasoning depth for everyday tasks' },
+                        { effort: 'high', description: 'Greater reasoning depth for complex problems' }
+                    ]
+                    : [
+                        { effort: 'low', description: 'Fast responses with lighter reasoning' },
+                        { effort: 'medium', description: 'Balances speed and reasoning depth for everyday tasks' },
+                        { effort: 'high', description: 'Greater reasoning depth for complex problems' }
+                    ],
+                shell_type: 'shell_command',
+                tool_mode: 'code_mode_only',
+                visibility: 'list',
+                supported_in_api: true,
+                priority: 0,
+                base_instructions: '',
+                supports_reasoning_summaries: isThinking,
+                default_reasoning_summary: 'none',
+                support_verbosity: false,
+                apply_patch_tool_type: 'freeform',
+                truncation_policy: { mode: 'bytes', limit: 10000 },
+                context_window: isThinking ? 1048576 : 131072,
+                max_context_window: isThinking ? 1048576 : 131072,
+                effective_context_window_percent: 95,
+                supports_parallel_tool_calls: true,
+                experimental_supported_tools: [],
+                input_modalities: isVision ? ['text', 'image'] : ['text'],
+                supports_image_detail_original: isVision
             };
         });
-        fs.writeFileSync(MODEL_CATALOG_PATH, JSON.stringify({ object: 'list', data }, null, 2), 'utf-8');
+        fs.writeFileSync(MODEL_CATALOG_PATH, JSON.stringify({ models: data }, null, 2), 'utf-8');
         console.log('[Proxy] Model catalog written:', data.length, 'models');
     } catch (e) {
         console.warn('[Proxy] Failed to write model catalog:', e.message);
@@ -309,6 +360,10 @@ function switchModel(modelId) {
     } catch (e) {
         log('Config write failed (non-fatal):', e.message);
     }
+
+    // Keep the catalog in sync with the switched model — otherwise Codex can't
+    // find a matching slug and silently drops tools.
+    writeModelCatalog(MODELS.length > 0 ? MODELS : BUILTIN_MODELS);
 
     return { ok: true, model: modelId };
 }
@@ -566,7 +621,7 @@ function convertRequest(responsesBody) {
     const chatBody = { ...responsesBody };
     if (DEBUG) {
         log('RAW request keys:', Object.keys(responsesBody).join(','));
-        log('RAW tools:', JSON.stringify(responsesBody.tools || null) !== 'undefined' ? JSON.stringify(responsesBody.tools).substring(0, 800) : 'none');
+        log('RAW tools:', responsesBody.tools ? JSON.stringify(responsesBody.tools).substring(0, 800) : 'none');
     }
     const hasWebSearchTool = Array.isArray(chatBody.tools) && chatBody.tools.some(
         t => t && (t.type === 'web_search' || t.type === 'web_search_preview')
