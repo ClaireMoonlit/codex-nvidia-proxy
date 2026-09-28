@@ -159,7 +159,7 @@ function writeModelCatalog(models) {
         }
         const data = list.map(m => {
             const isThinking = /thinking|deepseek-v4-pro|kimi-k2/.test(m.id);
-            const isVision = /vision|multimodal|vl\b|omni/.test(m.id);
+            const isVision = isVisionModel(m.id);
             return {
                 slug: m.id,
                 display_name: m.name,
@@ -378,7 +378,7 @@ function generateTags(modelId, ownedBy) {
     if (/flash|mini|small|nano|tiny/.test(lower) || /(?:^|[^0-9])([12378])b(?:$|[^0-9a-z])/.test(lower)) {
         add('fast');
     }
-    if (/vision|vl\b|multimodal|omni|image|video|ocr|deplot|kosmos|neva|nvclip|vila|fuyu|paligemma/.test(lower)) {
+    if (isVisionModel(lower)) {
         add('vision');
     }
     if (/moe|a\d+b|mixtral/.test(lower)) {
@@ -414,10 +414,18 @@ function modelSortKey(model) {
     return priority;
 }
 
-function isMultimodalModel(modelId) {
+// `integrate.api.nvidia.com` exposes no modality metadata: `/v1/models`,
+// `/v1/models?verbose=true` and `/v1/models/{id}` all return only
+// id/object/created/owned_by. Capability therefore has to be inferred from the
+// model id. This single predicate drives both the catalog's `input_modalities`
+// (which gates the desktop "attach image" button) and image handling in outgoing
+// requests — they must agree, otherwise the client accepts an image the proxy
+// then silently strips.
+const VISION_MODEL_RE = /vision|vl\b|multimodal|omni|glm-5\.3|image|video|ocr|deplot|kosmos|neva|nvclip|vila|fuyu|paligemma/;
+
+function isVisionModel(modelId) {
     if (!modelId) return false;
-    const lower = modelId.toLowerCase();
-    return /vision|vl\b|multimodal|omni|image|video|ocr|deplot|kosmos|neva|nvclip|vila|fuyu|paligemma/.test(lower);
+    return VISION_MODEL_RE.test(String(modelId).toLowerCase());
 }
 
 // `/v1/models` lists every model the key can access — embeddings, rerankers,
@@ -615,6 +623,7 @@ function convertRequest(responsesBody) {
                     };
                 }
                 log('Warning: dropped unsupported tool type:', t.type);
+                log('DROPPED TOOL FULL:', JSON.stringify(t).substring(0, 4000));
                 return null;
             })
             .filter(Boolean);
@@ -966,7 +975,9 @@ async function resolveHostedResponseStreaming(res, chatBody) {
         functionCalls: [],
         answerText: '',
         usageTotals: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
-        seq: 0
+        seq: 0,
+        clientGone: false,
+        upstream: null
     };
 
     if (res.socket) { res.socket.setNoDelay(true); }
@@ -991,6 +1002,18 @@ async function resolveHostedResponseStreaming(res, chatBody) {
         } catch (e) {}
     }, 3000);
 
+    // Desktop "pause" / window close aborts the HTTP request. Tear the stream down
+    // for real: stop the heartbeat, abort the upstream NIM stream (so reasoning
+    // deltas stop being produced and logged), and mark the client as gone.
+    const onClientClose = () => {
+        tempState.clientGone = true;
+        clearInterval(heartbeat);
+        if (tempState.upstream) {
+            try { tempState.upstream.destroy(); } catch (e) {}
+        }
+    };
+    res.on('close', onClientClose);
+
     const workingChatBody = JSON.parse(JSON.stringify(chatBody));
     workingChatBody.stream = true;
     workingChatBody.messages = Array.isArray(workingChatBody.messages) ? workingChatBody.messages : [];
@@ -1007,6 +1030,12 @@ async function resolveHostedResponseStreaming(res, chatBody) {
         log('STREAM_MAIN: first round returned null (external tool calls), finishing');
         clearInterval(heartbeat);
         await finishSseIfOpen(res);
+        return;
+    }
+
+    if (tempState.clientGone) {
+        log('STREAM_MAIN: client disconnected, abandoning round');
+        clearInterval(heartbeat);
         return;
     }
 
@@ -1175,7 +1204,7 @@ async function resolveHostedResponseStreaming(res, chatBody) {
         response: { id: tempState.responseId, status: 'completed', output: [] },
         sequence_number: tempState.seq++
     }));
-    await new Promise((r, rj) => res.write('data: [DONE]\n\n', e => e ? rj(e) : r()));
+    await writeSseRaw(res, 'data: [DONE]\n\n');
 }
 
 function finishSseIfOpen(res) {
@@ -1270,7 +1299,7 @@ async function emitAssistantTextAndComplete(res, responseId, text, skipHeader) {
         response: { id: responseId, status: 'completed', output: [] },
         sequence_number: seq++
     }));
-    await new Promise((r, rj) => res.write('data: [DONE]\n\n', e => e ? rj(e) : r()));
+    await writeSseRaw(res, 'data: [DONE]\n\n');
     try { res.end(); } catch (e) {}
 }
 
@@ -1406,6 +1435,13 @@ async function processResponseIncremental(response, onDelta) {
             streamEnded = true;
             checkComplete();
         });
+        // The upstream stream is destroyed when the client disconnects. Node emits
+        // 'close' (not 'end') in that case, so settle the promise here — otherwise
+        // the round would hang forever and leak the heartbeat timer.
+        response.on('close', () => {
+            streamEnded = true;
+            checkComplete();
+        });
         response.on('error', reject);
     });
 }
@@ -1415,6 +1451,13 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
     const result = await forwardRequestWithRetry(null, bodyStr);
     const response = result.response;
     const statusCode = response.statusCode || 200;
+
+    // Hand the upstream stream to the shared client-close handler (registered in
+    // resolveHostedResponseStreaming) so a disconnect can abort it immediately.
+    state.upstream = response;
+    if (state.clientGone) {
+        try { response.destroy(); } catch (e) {}
+    }
 
     if (statusCode !== 200) {
         const raw = await readIncomingMessage(response);
@@ -1632,7 +1675,7 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
             response: { id: state.responseId, status: 'completed', output: [] },
             sequence_number: state.seq++
         }));
-        await new Promise((r, rj) => res.write('data: [DONE]\n\n', e => e ? rj(e) : r()));
+        await writeSseRaw(res, 'data: [DONE]\n\n');
         return null;
     }
 
@@ -1703,7 +1746,7 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
             response: { id: state.responseId, status: 'completed', output: [] },
             sequence_number: state.seq++
         }));
-        await new Promise((r, rj) => res.write('data: [DONE]\n\n', e => e ? rj(e) : r()));
+        await writeSseRaw(res, 'data: [DONE]\n\n');
     }
 
     return streamResult;
@@ -1721,10 +1764,23 @@ async function readIncomingMessageLines(response) {
     });
 }
 
-async function writeSseLine(res, line) {
-    await new Promise((resolve, reject) => {
-        res.write('data: ' + line + '\n\n', (err) => err ? reject(err) : resolve());
+// Write raw bytes to the SSE response, tolerating a disconnected client. Once
+// the socket is gone `res.write` throws ERR_STREAM_DESTROYED synchronously, which
+// would otherwise abort the round with a bogus "stream error" — the intended
+// behaviour is to drop the event and let the round wind down quietly.
+async function writeSseRaw(res, text) {
+    if (res.destroyed || res.writableEnded) return;
+    await new Promise((resolve) => {
+        try {
+            res.write(text, () => resolve());
+        } catch (e) {
+            resolve();
+        }
     });
+}
+
+async function writeSseLine(res, line) {
+    await writeSseRaw(res, 'data: ' + line + '\n\n');
 }
 
 function splitTextIntoChunks(text, maxLen) {
@@ -1926,7 +1982,7 @@ async function streamResponseObject(res, responseObject, skipHeader) {
         }
     });
 
-    await new Promise((r, rj) => res.write('data: [DONE]\n\n', e => e ? rj(e) : r()));
+    await writeSseRaw(res, 'data: [DONE]\n\n');
 }
 
 function computeRetryDelayMs(attemptNumber, retryAfterHeader) {
@@ -2046,7 +2102,7 @@ const proxyServer = http.createServer(async (req, res) => {
                 const chatBody = convertRequest(responsesBody);
                 chatBody.model = chatBody.model || currentModel;
 
-                if (!isMultimodalModel(chatBody.model) && Array.isArray(chatBody.messages)) {
+                if (!isVisionModel(chatBody.model) && Array.isArray(chatBody.messages)) {
                     let imagesStripped = 0;
                     for (const msg of chatBody.messages) {
                         if (Array.isArray(msg.content)) {
@@ -2066,7 +2122,7 @@ const proxyServer = http.createServer(async (req, res) => {
                     }
                 }
 
-                if (isMultimodalModel(chatBody.model) && Array.isArray(chatBody.messages)) {
+                if (isVisionModel(chatBody.model) && Array.isArray(chatBody.messages)) {
                     const maxImages = /llama.*vision/.test(chatBody.model.toLowerCase()) ? 1 : 1;
                     const imageMessages = [];
                     for (let i = 0; i < chatBody.messages.length; i++) {
@@ -2174,7 +2230,7 @@ const proxyServer = http.createServer(async (req, res) => {
                         : (statusCode === 500
                             ? streamErr.message
                             : 'NVIDIA NIM returned ' + statusCode + '. The model may be overloaded. Try again or switch models.');
-                    if (!res.writableEnded) {
+                    if (!res.writableEnded && !res.destroyed) {
                         // response.created / response.in_progress were already
                         // written before the stream errored, so append only the
                         // message + completion events (skipHeader = true). The
