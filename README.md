@@ -1,138 +1,119 @@
 # Codex NIM Proxy
 
-> 让 Codex 白嫖 NVIDIA 免费顶级模型：DeepSeek V4 Pro、Qwen3 Coder、Kimi K2.6 一键接入
+> 让 Codex 白嫖 NVIDIA 免费顶级模型：DeepSeek V4.1 Flash、GLM-5.3、Kimi K3 一键接入
 > Use Codex with NVIDIA's free top-tier models — one-click access
 
-Codex（CLI / 桌面版）与 NVIDIA NIM 之间的透明代理，让 Codex 免费使用 NVIDIA 托管的顶级模型。
+## 这是什么
 
-## 项目简介
+Codex 是 OpenAI 的编程助手，自带 CLI 和桌面版，但默认只能用 OpenAI 的模型。NVIDIA NIM 免费开放了一批顶级模型，只是 Codex 不认识它的接口格式。
 
-[Codex](https://github.com/openai/codex) 是 OpenAI 的 AI 编程助手（提供 CLI 和桌面版），但默认只能使用 OpenAI 的模型。[NVIDIA NIM](https://build.nvidia.com/explore/discover) 免费提供 DeepSeek V4 Pro、Qwen3 Coder 480B、Kimi K2.6 等顶级模型。
+本项目就是中间那层翻译：
 
-本项目是一个轻量级代理，在 Codex 和 NVIDIA NIM 之间透明转换 Responses API ↔ Chat Completions API 格式，让 Codex 无缝调用这些免费模型。
+```
+Codex  →  本地代理（本项目）  →  NVIDIA 免费模型
+```
+
+启动它，Codex 就能像用官方模型一样直接选用这些免费模型；关掉它，Codex 完好如初。整个过程不用改配置、不用换账号、不用装任何第三方包。
 
 ## 支持的模型
 
-> 以下为精选推荐（更新于 2026-06）。代理启动时会自动从 NVIDIA NIM 实时拉取全部可用模型并写入 Codex 模型目录，客户端模型列表始终实时、无需手动维护。模型可用性以客户端实时列表为准。
+不需要记模型名。代理每次启动都会从 NVIDIA 拉取当前可用的全部模型，直接写进 Codex 的模型列表，你在 Codex 里挑就行。
 
-| 模型 | 特点 |
-|------|------|
-| DeepSeek V4 Pro | 1.6T MoE, 49B active, 1M ctx, Think/Non-Think hybrid |
-| DeepSeek V4 Flash | 284B MoE, 13B active, 快速编码 & agent |
-| Qwen3 Coder 480B | 专用编码模型, 35B active, 256K ctx |
-| Kimi K2.6 | 1T multimodal MoE, 长程编码 |
-| Qwen3.5 122B | 快速通用, 10B active, ~110 tok/s |
-| MiniMax M2.7 | 230B, 编码+推理+办公 |
-| GLM-5.1 | 智谱旗舰, agentic & 长程推理 |
-| Gemma 4 31B | Google 稠密模型, 编码 & agentic |
-| Nemotron Super 120B | NVIDIA 混合 Mamba-Transformer, 1M ctx, tool calling |
-| Mistral Large 3 | 675B 旗舰, 编码 & tool calling |
-| Mistral Medium 3.5 | 128B, 编码 & agentic |
-| Nemotron Super 49B | NVIDIA 调优, 编码 & tool calling |
-| Llama 3.2 90B Vision | 最大视觉模型, 图片理解+编码 |
-| Phi-4 Multimodal | 多模态推理, 视觉+音频+文本 |
-| Step 3.5 Flash | 200B MoE, frontier agentic |
-| Llama 3.1 405B | 最大稠密模型, 强指令跟随 |
-| Seed-OSS 36B | 字节跳动, 512K ctx, 长上下文推理 & agentic |
+下面是 2026-09 实测可用的代表性模型：
 
-## 架构
+| 模型 | 适合用来做 |
+|------|-----------|
+| DeepSeek V4.1 Flash | 日常编码、快速改 bug，响应快 |
+| Kimi K3 | 读大项目、长上下文任务 |
+| GLM-5.3 / GLM-5.3 Flash | 中文场景友好，推理与 agent 任务 |
+| Nemotron 3 Ultra 550B | NVIDIA 旗舰，复杂推理 |
+| Nemotron 3 Super 120B | 综合均衡，工具调用稳定 |
+| Nemotron 3.5 Lightning 30B | 轻量高速，简单任务够用 |
+| Gemma 4 31B | Google 通用模型 |
+| Mistral Large 2 | Mistral 旗舰 |
+| gpt-oss 20B | OpenAI 开源模型 |
+| Llama 3.2 90B Vision | 支持看图，能读截图 |
 
-```mermaid
-sequenceDiagram
-    participant C as Codex
-    participant P as Proxy (:15721)
-    participant N as NVIDIA NIM
-    C->>P: POST /v1/responses
-    P->>N: POST /v1/chat/completions
-    N-->>P: SSE stream
-    P-->>C: SSE stream
-```
+NVIDIA 会不时上架和下架模型，所以以 Codex 客户端里显示的实时列表为准，本表不保证长期准确。
 
-- 单文件 [`responses_proxy.cjs`](./responses_proxy.cjs)，零外部依赖，纯 Node.js 内置模块
-- 监听 `http://127.0.0.1:15721`
-- 透明转换 Codex Responses API ↔ NVIDIA Chat Completions API
-- 支持流式(SSE)和非流式请求
+## 它能做什么
 
-## 功能
-
-- **零依赖** — 单文件纯 Node.js，无需 `npm install`
-- **格式透明转换** — 自动处理 Codex Responses API 与 NVIDIA Chat Completions API 之间的所有字段映射
-- **流式输出** — 实时 SSE 流，思考过程和正文分离显示
-- **Web 搜索** — 内置搜索引擎，Codex 发起搜索时代理自动执行
-- **原生模型选择** — 模型列表实时同步到 Codex 客户端（桌面版/CLI 直接选模型，无需额外 Web 界面）
-- **配置自动恢复** — 关闭代理自动恢复 Codex 原始配置，回到 OpenAI 官方模式
-- **自动重试** — 网络波动或服务繁忙时自动重试，无需手动干预
-- **模型黑名单** — 返回 404 的不可用模型自动屏蔽（如需重新测试，删除 `model_blacklist.json` 后重启）
-- **工具调用兼容** — 自动转换 function_call 输入格式，兼容不同模型；MCP 服务器工具与子代理工具（Codex 的 `namespace` 分组）自动展平为顶层工具，自由格式工具（`apply_patch`）以单字段形式桥接，调用结果再按 Codex 的路由格式回填
-
-## 前置条件
-
-- [Node.js](https://nodejs.org/) >= 18
-- [Codex](https://github.com/openai/codex)（CLI 或桌面版）已安装
-- [NVIDIA NIM API Key](https://build.nvidia.com/explore/discover)（免费注册获取）
+- **免费使用** — 花的是你自己的 NVIDIA 免费额度，不需要订阅
+- **模型列表自动更新** — 启动即拉取，不用手动维护
+- **工具能力完整** — 改文件、执行命令、联网搜索、调用 MCP 工具和子代理工具都能正常用（CLI 和桌面版均已实测）
+- **技能与指令完整传递** — Codex 下发的技能说明会原样交给模型
+- **配置自动来回** — 启动时自动接管 Codex 配置，退出时自动还原，不留残留
+- **断线自愈** — 网络抖动或服务繁忙时自动重试
+- **失效模型自动屏蔽** — NVIDIA 已下架的模型会自动从列表里移除
+- **零依赖** — 单个文件、纯 Node.js，不需要 npm install
 
 ## 快速开始
 
+前置条件：
+
+- Node.js 18 或以上
+- Codex（CLI 或桌面版）已安装
+- 一个免费的 NVIDIA NIM API Key
+
 ```bash
-# 1. 克隆
 git clone https://github.com/ClaireMoonlit/codex-nvidia-proxy.git
 cd codex-nvidia-proxy
 
-# 2. 配置 API Key
-copy .env.example .env
-# 编辑 .env，填入你的 NVIDIA_API_KEY
-
-# 3. 启动
+copy .env.example .env      # 然后把你的 NVIDIA_API_KEY 填进 .env
 node responses_proxy.cjs
 ```
 
 Windows 用户也可以直接双击 `start_proxy.bat`。
 
-## 配置 Codex
+启动后打开 Codex，在模型选择器里挑一个模型就能开始用（桌面版在模型下拉框里选，CLI 用 `/model`）。
 
-代理启动时会自动备份原始配置并写入 `model_provider` 格式，**无需手动修改 `config.toml`**。
+## 关掉它
 
-关闭代理（Ctrl+C）时自动恢复原始配置，Codex 回到 OpenAI 官方模式。
+在启动代理的窗口按 `Ctrl+C` 即可。代理会把 Codex 的配置还原成原样，Codex 回到只使用 OpenAI 官方模型的状态。
 
-模型切换直接使用 Codex 客户端（桌面版模型选择器，或 CLI 的 `/model` 命令）。
+## 常见问题
+
+**模型列表里没有刚上架的新模型？**
+Codex 只在启动时读一次模型列表，重启 Codex 客户端即可看到。
+
+**提示额度不足或请求被拒？**
+通常是这个 NVIDIA 账号的免费额度用完了，换一个 Key 或稍后再试。
+
+**想重新试一个被屏蔽的模型？**
+删掉 `model_blacklist.json`，然后重启代理。
+
+**代理关了以后 Codex 变回 OpenAI 了？**
+正常，这就是自动还原的效果。
+
+**怎么确认代理真的在工作？**
+在 PowerShell 里跑下面这条命令，能看到滚动输出的 `data:` 就说明通了：
+
+```powershell
+$body = '{"model":"z-ai/glm-5.3-flash","input":[{"role":"user","content":"Say the single word: pong"}],"stream":true}'
+Invoke-WebRequest -Uri http://127.0.0.1:15721/v1/responses -Method POST -Body $body -ContentType "application/json"
+```
 
 ## 环境变量
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `NVIDIA_API_KEY` | NVIDIA NIM API Key（**必需**） | 无 |
-| `DEBUG` | 开启调试日志 | `false` |
-
-## 测试
-
-```powershell
-# 非流式
-$body = '{"model":"deepseek-ai/deepseek-v4-flash","messages":[{"role":"user","content":"Hello"}],"stream":false}'
-Invoke-WebRequest -Uri http://127.0.0.1:15721/v1/responses -Method POST -Body $body -ContentType "application/json"
-
-# 流式
-$body = '{"model":"deepseek-ai/deepseek-v4-flash","messages":[{"role":"user","content":"Write a haiku"}],"stream":true}'
-Invoke-WebRequest -Uri http://127.0.0.1:15721/v1/responses -Method POST -Body $body -ContentType "application/json"
-
-# 带搜索
-$body = '{"model":"deepseek-ai/deepseek-v4-flash","input":[{"role":"user","content":"What is the weather in Beijing today?"}],"tools":[{"type":"web_search"}],"stream":true}'
-Invoke-WebRequest -Uri http://127.0.0.1:15721/v1/responses -Method POST -Body $body -ContentType "application/json"
-```
+| `NVIDIA_API_KEY` | NVIDIA NIM API Key，**必需** | 无 |
+| `DEBUG` | 打印详细调试日志，排查问题时设为 `true` | `false` |
 
 ## 项目结构
 
 ```
 codex-nvidia-proxy/
-├── responses_proxy.cjs   # 主代理（单文件，零依赖）
-├── models.json           # 模型列表配置
-├── model_state.json      # 当前选中模型（动态生成）
-├── model_blacklist.json  # 不可用模型黑名单（动态生成）
-├── package.json          # 项目元数据（零外部依赖）
-├── start_proxy.bat       # Windows 启动脚本
-├── .env.example          # 环境变量模板
-└── .gitignore
+├── responses_proxy.cjs    # 主程序（单文件，零依赖）
+├── start_proxy.bat        # Windows 启动脚本
+├── .env.example           # API Key 配置模板
+├── models.json            # 内置兜底模型列表（拿不到实时列表时才用）
+├── model_state.json       # 当前选中的模型（自动生成）
+├── model_blacklist.json   # 不可用模型黑名单（自动生成）
+├── package.json           # 项目元数据（无外部依赖）
+└── LICENSE
 ```
 
 ## 许可
 
-MIT License — 详见 [LICENSE](./LICENSE)
+MIT License，详见 [LICENSE](./LICENSE)
