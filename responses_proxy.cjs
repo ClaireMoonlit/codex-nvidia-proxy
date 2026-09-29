@@ -753,8 +753,13 @@ function convertRequest(responsesBody) {
                 });
                 continue;
             }
-            if (item.role === 'system' || item.role === 'user' || item.role === 'assistant') {
-                const msg = { role: item.role };
+            // Codex sends its skills and instruction blocks as `developer`
+            // messages. NIM only knows `system`, which carries the same
+            // authority, so the role is mapped across instead of the whole
+            // message being dropped.
+            const role = item.role === 'developer' ? 'system' : item.role;
+            if (role === 'system' || role === 'user' || role === 'assistant') {
+                const msg = { role };
                 if (typeof item.content === 'string') {
                     msg.content = item.content;
                 } else if (Array.isArray(item.content)) {
