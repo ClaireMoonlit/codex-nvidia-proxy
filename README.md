@@ -106,7 +106,7 @@ Codex 只在启动时读一次模型列表，重启 Codex 客户端即可看到�
 </details>
 
 <details>
-<summary><b>`/model` 里看不到 NIM 模型？</b></summary>
+<summary><b><code>/model</code> 里看不到 NIM 模型？</b></summary>
 
 先确认代理还活着（`http://127.0.0.1:15721` 有响应），再用 `codex debug models` 看 CLI 实际加载到的目录。
 
