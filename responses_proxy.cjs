@@ -1614,7 +1614,28 @@ async function resolveHostedResponseCore(chatBody, sharedState, startRound) {
         }
     }
 
-    throw new Error('Hosted web_search exceeded max continuation rounds');
+    // Every round up to the budget asked for more searches. Rather than failing
+    // the turn, ask one last time with the search tools removed so the model has
+    // to answer with the information it already gathered.
+    log('HOSTED SEARCH:', 'round budget exhausted, forcing a final answer');
+    const finalBody = JSON.parse(JSON.stringify(workingChatBody));
+    delete finalBody.tools;
+    delete finalBody.tool_choice;
+    finalBody.messages.push({
+        role: 'system',
+        content: 'Web search budget exhausted. Answer the user now with the information already gathered.'
+    });
+    const finalResp = await requestChatCompletionJson(finalBody);
+    addUsageTotals(state.usageTotals, finalResp.usage);
+    const finalChoice = (finalResp.choices && finalResp.choices[0]) || {};
+    const finalMessage = finalChoice.message || {};
+    const finalReasoning = extractReasoningText(finalMessage);
+    if (finalReasoning) state.reasoningParts.push(finalReasoning);
+    state.functionCalls = [];
+    state.answerText = extractTextContent(finalMessage.content)
+        || errorReply('NIM proxy: web search limit reached',
+            'No final answer was produced before the search budget ran out. Try rephrasing the question, or provide the details you already have.');
+    return buildResponseObjectFromState(state);
 }
 
 async function processResponseIncremental(response, onDelta) {
