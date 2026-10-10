@@ -1403,6 +1403,46 @@ function finishSseIfOpen(res) {
     }
 }
 
+// Codex does not render `type: 'error'` SSE events, so proxy-side failures are
+// delivered as ordinary assistant messages. Quoting them with a bold header
+// keeps them visually distinct from real model replies.
+function errorReply(title, detail) {
+    return '> **' + title + '**\n>\n> ' + detail;
+}
+
+// Turn a failed upstream request into an alert reply. 404 means the model is
+// gone from this account, 402 an exhausted quota, 401/403 a rejected key, 429
+// throttling; a 500 without a response body is a bug in the proxy itself.
+function upstreamErrorReply(statusCode, err, model) {
+    const raw = (err && err.message) || 'unknown error';
+    if (statusCode === 404) {
+        return errorReply('NIM proxy: model not available (404)',
+            'NVIDIA NIM does not serve "' + (model || '') + '". It was removed from your model list — switch to another model.');
+    }
+    if (statusCode === 402) {
+        return errorReply('NIM proxy: NVIDIA quota exhausted (402)',
+            'The free trial quota for this NVIDIA account is used up, so the request was rejected. Switching models will not help — use a different API key (or a paid endpoint) and retry.');
+    }
+    if (statusCode === 401 || statusCode === 403) {
+        return errorReply('NIM proxy: API key rejected (' + statusCode + ')',
+            'NVIDIA refused the API key. Check NVIDIA_API_KEY in .env, restart the proxy, then retry.');
+    }
+    if (statusCode === 429) {
+        return errorReply('NIM proxy: rate limited (429)',
+            'NVIDIA is throttling this key — the free tier allows only a few requests per minute per model. Wait a moment and retry, or switch to another model.');
+    }
+    if (statusCode === 500 && !(err && err.body)) {
+        return errorReply('NIM proxy: internal error (500)',
+            raw + '\n>\n> This is a bug in the proxy itself, not a model reply. Restart the proxy and retry; if it keeps happening, please report the message above.');
+    }
+    if (statusCode >= 500) {
+        return errorReply('NIM proxy: NVIDIA server error (' + statusCode + ')',
+            'NVIDIA returned an internal error. Try again in a moment, or switch models.');
+    }
+    return errorReply('NIM proxy: NVIDIA error (' + statusCode + ')',
+        'The model may be overloaded. Try again or switch models.');
+}
+
 // Build a Responses-API JSON object whose single message carries the given
 // text. Used to surface proxy-side errors (e.g. blacklisted/404 model) to the
 // non-streaming client as a normal assistant message instead of an opaque 500.
@@ -2362,7 +2402,8 @@ const proxyServer = http.createServer(async (req, res) => {
                 // returned 404 for it before. Answer with a clear message instead
                 // of round-tripping to NIM and waiting for another 404.
                 if (BLACKLISTED_MODELS.has(chatBody.model)) {
-                    const errText = 'Model "' + chatBody.model + '" is not available (it was previously blacklisted). Switch to a different model.';
+                    const errText = errorReply('NIM proxy: model unavailable',
+                        'Model "' + chatBody.model + '" was removed from your model list earlier (NIM does not serve it). Switch to another model.');
                     log('Pre-flight blacklist rejection:', chatBody.model);
                     if (isStream) {
                         res.writeHead(200, {
@@ -2386,10 +2427,7 @@ const proxyServer = http.createServer(async (req, res) => {
                     } catch (e) {
                         const statusCode = e.statusCode || 500;
                         if (statusCode === 404) blacklistModel(chatBody.model);
-                        const errText = statusCode === 404
-                            ? 'Model "' + chatBody.model + '" is not available on NVIDIA NIM (404). It has been removed from your model list — switch to another model.'
-                            : (statusCode === 500 ? e.message : 'NVIDIA NIM returned ' + statusCode + '. The model may be overloaded. Try again or switch models.');
-                        resp = buildMessageResponseObject('resp_error_' + Date.now(), errText);
+                        resp = buildMessageResponseObject('resp_error_' + Date.now(), upstreamErrorReply(statusCode, e, chatBody.model));
                     }
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify(resp));
@@ -2411,18 +2449,12 @@ const proxyServer = http.createServer(async (req, res) => {
                     log('Stream error:', streamErr.message);
                     if (streamErr.body) log('Stream error body:', streamErr.body.substring(0, 500));
                     const statusCode = streamErr.statusCode || 500;
-                    const isNotFound = statusCode === 404;
-                    const errText = isNotFound
-                        ? 'Model "' + (chatBody.model || '') + '" is not available on NVIDIA NIM (404). It has been removed from your model list — switch to another model.'
-                        : (statusCode === 500
-                            ? streamErr.message
-                            : 'NVIDIA NIM returned ' + statusCode + '. The model may be overloaded. Try again or switch models.');
                     if (!res.writableEnded && !res.destroyed) {
                         // response.created / response.in_progress were already
                         // written before the stream errored, so append only the
                         // message + completion events (skipHeader = true). The
                         // `type: 'error'` event is not rendered by Codex.
-                        await emitAssistantTextAndComplete(res, 'resp_error_' + Date.now(), errText, true);
+                        await emitAssistantTextAndComplete(res, 'resp_error_' + Date.now(), upstreamErrorReply(statusCode, streamErr, chatBody.model), true);
                     }
                     // Blacklist models that return 404 (not available for this account)
                     if (statusCode === 404) {
