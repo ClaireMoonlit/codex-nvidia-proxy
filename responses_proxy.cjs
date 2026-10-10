@@ -1298,9 +1298,14 @@ async function resolveHostedResponseStreaming(res, chatBody) {
         }));
     }
 
+    // Slots are handed out two at a time (see the +2 offsets below). Track the
+    // next free slot outside the guard so the post-search tool calls further
+    // down stay correctly indexed even when there is no answer text.
+    let nextFreeIdx = combinedNewReasoning ? (tempState.searchEvents.length + 4) : (tempState.searchEvents.length + 2);
+
     if (tempState.answerText) {
         const itemId = tempState.responseId + '_msg_postsearch';
-        const outIdx = combinedNewReasoning ? (tempState.searchEvents.length + 4) : (tempState.searchEvents.length + 2);
+        const outIdx = nextFreeIdx;
         await writeSseLine(res, JSON.stringify({
             type: 'response.output_item.added',
             item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
@@ -1349,11 +1354,12 @@ async function resolveHostedResponseStreaming(res, chatBody) {
             output_index: outIdx,
             sequence_number: tempState.seq++
         }));
+        nextFreeIdx += 2;
     }
 
     const externalFcAfterSearch = tempState.functionCalls && tempState.functionCalls.filter(tc => tc.name !== 'web_search');
     if (externalFcAfterSearch && externalFcAfterSearch.length > 0) {
-        const fcBaseIdx = outIdx + 2;
+        const fcBaseIdx = nextFreeIdx;
         for (let i = 0; i < externalFcAfterSearch.length; i++) {
             const tc = externalFcAfterSearch[i];
             const fcIdx = fcBaseIdx + i;
@@ -1388,6 +1394,7 @@ async function resolveHostedResponseStreaming(res, chatBody) {
         sequence_number: tempState.seq++
     }));
     await writeSseRaw(res, 'data: [DONE]\n\n');
+    await finishSseIfOpen(res);
 }
 
 function finishSseIfOpen(res) {
