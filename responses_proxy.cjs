@@ -40,7 +40,7 @@ const PROXY_API_BASE = 'http://127.0.0.1:15721/v1';
 
 // 顶层由代理负责写入/清理的键（不属于任何 [section]）。
 // 清理时只对这些键动手，绝不改动用户自己定义的其它 provider 段。
-const PROXY_TOP_KEYS = /^(api_base_url|model_provider|model|model_catalog_json|model_reasoning_effort|model_reasoning_summary|model_supports_reasoning_summaries|show_raw_agent_reasoning)\s*=/;
+const PROXY_TOP_KEYS = /^(api_base_url|model_provider|model|model_catalog_json|model_reasoning_effort|model_reasoning_summary|model_supports_reasoning_summaries|show_raw_agent_reasoning|hide_agent_reasoning)\s*=/;
 const PROXY_PROVIDER_SECTION = 'model_providers.nvidia-proxy';
 
 // 从 TOML 内容中移除代理写入的配置：
@@ -109,20 +109,29 @@ function writeProxyConfig(modelId) {
         content = removeProxyConfig(content).trim();
 
         // 顶层键必须写在任何 [section] header 之前，否则 TOML 作用域会出错
-        const providerConfig = 'model_provider = "nvidia-proxy"\n' +
+        // （写在末尾会被并入最后一个 section，Codex 会读不到）。
+        let topKeys = 'model_provider = "nvidia-proxy"\n' +
             'model = "' + modelId + '"\n' +
-            'model_catalog_json = "model-catalog.json"\n\n' +
+            'model_catalog_json = "model-catalog.json"\n';
+        const isThinking = modelId.includes('thinking') || modelId.includes('deepseek-v4-pro') || modelId.includes('kimi-k2');
+        if (isThinking) {
+            topKeys += 'model_reasoning_effort = "high"\n';
+        }
+        // Any NIM model may stream `reasoning_content`, and Codex only renders
+        // reasoning summaries when the model is declared to support them — so the
+        // summary switches are written for every model. Same set DeepSeek's
+        // official Codex integration writes for its third-party models.
+        // `hide_agent_reasoning = false` is set explicitly: the desktop UI hides
+        // reasoning outright when it is on, and its default differs per client.
+        topKeys += 'model_reasoning_summary = "detailed"\nmodel_supports_reasoning_summaries = true\nshow_raw_agent_reasoning = true\nhide_agent_reasoning = false\n';
+
+        const providerConfig = topKeys + '\n' +
             '[model_providers.nvidia-proxy]\n' +
             'name = "NVIDIA NIM Proxy"\n' +
             'base_url = "http://127.0.0.1:15721/v1"\n' +
             'wire_api = "responses"\n';
 
         content = providerConfig + '\n' + content;
-
-        const isThinking = modelId.includes('thinking') || modelId.includes('deepseek-v4-pro') || modelId.includes('kimi-k2');
-        if (isThinking) {
-            content += 'model_reasoning_effort = "high"\nmodel_reasoning_summary = "detailed"\nmodel_supports_reasoning_summaries = true\nshow_raw_agent_reasoning = true\n';
-        }
 
         fs.writeFileSync(CONFIG_PATH, content, 'utf-8');
     } catch (e) {
@@ -182,7 +191,8 @@ function writeModelCatalog(models) {
                 supported_in_api: true,
                 priority: 0,
                 base_instructions: '',
-                supports_reasoning_summaries: isThinking,
+                supports_reasoning_summaries: true,
+                reasoning_summary_format: 'experimental',
                 default_reasoning_summary: 'none',
                 support_verbosity: false,
                 apply_patch_tool_type: 'freeform',
@@ -543,9 +553,12 @@ function toToolArguments(input) {
 // request, so the real shape can only be learned from the client itself. Dump
 // the raw tool surface whenever it changes so it can be inspected directly
 // instead of guessed at (and instead of copying it out of a terminal by hand).
+// DEBUG-gated: it is a debugging aid, not something to leave behind in the
+// project directory on every run.
 const TOOL_DUMP_PATH = path.join(__dirname, 'tool_dump.json');
 let lastToolDump = '';
 function dumpToolSurface(tools) {
+    if (!DEBUG) return;
     try {
         const json = JSON.stringify(tools, null, 2);
         if (json === lastToolDump) return;
@@ -1022,19 +1035,35 @@ function readIncomingMessage(incoming) {
     });
 }
 
+// DeepSeek models sometimes leak their internal tool-call markup into the text
+// channel when the serving layer fails to strip its own special tokens. It then
+// reaches Codex as an ordinary assistant message ("<...> calls") with no tool
+// call attached, which is meaningless to the user. The delimiters are U+FF5C
+// (fullwidth vertical line); they are written as escapes because the literal
+// sequence is itself unstable in some pipelines.
+const PRIVATE_MARKUP = new RegExp('<\uFF5C[^\\n]{0,200}>', 'g');
+function stripPrivateMarkup(text) {
+    if (!text || typeof text !== 'string') return text;
+    const cleaned = text.replace(PRIVATE_MARKUP, '');
+    if (cleaned !== text) {
+        console.warn('[Proxy] Stripped model-internal markup that leaked into the text channel');
+    }
+    return cleaned;
+}
+
 function extractTextContent(content) {
-    if (typeof content === 'string') return content;
+    if (typeof content === 'string') return stripPrivateMarkup(content);
     if (Array.isArray(content)) {
-        return content
+        return stripPrivateMarkup(content
             .filter(part => part && (part.type === 'text' || part.type === 'output_text' || part.type === 'input_text'))
             .map(part => part.text || '')
-            .join('');
+            .join(''));
     }
     return '';
 }
 
 function extractReasoningText(message) {
-    return message.reasoning || message.reasoning_content || '';
+    return stripPrivateMarkup(message.reasoning || message.reasoning_content || '');
 }
 
 function normalizeToolCalls(toolCalls) {
@@ -1080,11 +1109,9 @@ function buildResponseObjectFromState(state) {
 
     if (combinedReasoning) {
         output.push({
-            type: 'message',
+            type: 'reasoning',
             id: responseId + '_think',
-            role: 'assistant',
-            status: 'completed',
-            content: [{ type: 'output_text', text: combinedReasoning }]
+            summary: [{ type: 'summary_text', text: combinedReasoning }]
         });
     }
 
@@ -1104,13 +1131,24 @@ function buildResponseObjectFromState(state) {
         ));
     }
 
-    if (state.answerText) {
+    if (state.answerText && state.answerText.trim()) {
         output.push({
             type: 'message',
             id: responseId + '_msg',
             role: 'assistant',
             status: 'completed',
             content: [{ type: 'output_text', text: state.answerText }]
+        });
+    }
+
+    // Nothing the user can act on came back (no answer, no tool call).
+    if (!output.some(o => o.type === 'message' || o.type === 'function_call' || o.type === 'custom_tool_call')) {
+        output.push({
+            type: 'message',
+            id: responseId + '_empty',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ type: 'output_text', text: emptyReplyText(state.model) }]
         });
     }
 
@@ -1158,7 +1196,8 @@ async function resolveHostedResponseStreaming(res, chatBody) {
         usageTotals: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
         seq: 0,
         clientGone: false,
-        upstream: null
+        upstream: null,
+        model: chatBody.model
     };
 
     if (res.socket) { res.socket.setNoDelay(true); }
@@ -1248,52 +1287,54 @@ async function resolveHostedResponseStreaming(res, chatBody) {
 
     if (combinedNewReasoning) {
         const itemId = tempState.responseId + '_think_postsearch';
+        const reasonIdx = tempState.searchEvents.length + 2;
+        // Native `reasoning` item, same shape the round-0 stream emits.
         await writeSseLine(res, JSON.stringify({
             type: 'response.output_item.added',
-            item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
-            output_index: tempState.searchEvents.length + 2,
+            item: { id: itemId, type: 'reasoning', summary: [] },
+            output_index: reasonIdx,
             sequence_number: tempState.seq++
         }));
         await writeSseLine(res, JSON.stringify({
-            type: 'response.content_part.added',
-            part: { id: itemId + '_part0', type: 'output_text', text: '' },
+            type: 'response.reasoning_summary_part.added',
+            part: { type: 'summary_text', text: '' },
             item_id: itemId,
-            output_index: tempState.searchEvents.length + 2,
-            content_index: 0,
+            output_index: reasonIdx,
+            summary_index: 0,
             sequence_number: tempState.seq++
         }));
         const chunks = splitTextIntoChunks(combinedNewReasoning, 40);
         for (const chunk of chunks) {
             await writeSseLine(res, JSON.stringify({
-                type: 'response.output_text.delta',
+                type: 'response.reasoning_summary_text.delta',
                 delta: chunk,
                 item_id: itemId,
-                output_index: tempState.searchEvents.length + 2,
-                content_index: 0,
+                output_index: reasonIdx,
+                summary_index: 0,
                 sequence_number: tempState.seq++
             }));
             await new Promise(r => setTimeout(r, 15));
         }
         await writeSseLine(res, JSON.stringify({
-            type: 'response.output_text.done',
+            type: 'response.reasoning_summary_text.done',
             text: combinedNewReasoning,
             item_id: itemId,
-            output_index: tempState.searchEvents.length + 2,
-            content_index: 0,
+            output_index: reasonIdx,
+            summary_index: 0,
             sequence_number: tempState.seq++
         }));
         await writeSseLine(res, JSON.stringify({
-            type: 'response.content_part.done',
-            part: { id: itemId + '_part0', type: 'output_text', text: combinedNewReasoning },
+            type: 'response.reasoning_summary_part.done',
+            part: { type: 'summary_text', text: combinedNewReasoning },
             item_id: itemId,
-            output_index: tempState.searchEvents.length + 2,
-            content_index: 0,
+            output_index: reasonIdx,
+            summary_index: 0,
             sequence_number: tempState.seq++
         }));
         await writeSseLine(res, JSON.stringify({
             type: 'response.output_item.done',
-            item: { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: combinedNewReasoning }] },
-            output_index: tempState.searchEvents.length + 2,
+            item: { id: itemId, type: 'reasoning', summary: [{ type: 'summary_text', text: combinedNewReasoning }] },
+            output_index: reasonIdx,
             sequence_number: tempState.seq++
         }));
     }
@@ -1443,6 +1484,64 @@ function upstreamErrorReply(statusCode, err, model) {
         'The model may be overloaded. Try again or switch models.');
 }
 
+// A turn that yields no text, no tool call and no thinking is nothing the user
+// can act on. That happens when the model emits only its internal markup (which
+// is stripped on the way out) or returns empty content — say so instead of
+// leaving a silently empty turn.
+function emptyReplyText(model) {
+    return errorReply('NIM proxy: empty reply from the model',
+        (model ? '"' + model + '" ' : '') + 'returned no text, no tool call and no reasoning this turn — usually because it emitted only its internal markup, which is filtered out. Retry once, or switch to another model.');
+}
+
+// Emit a complete assistant-message item without ending the stream, so callers
+// can keep going (used to report an otherwise-empty turn before completing).
+async function writeAssistantMessageEvents(res, itemId, text, outputIndex, state) {
+    await writeSseLine(res, JSON.stringify({
+        type: 'response.output_item.added',
+        item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
+        output_index: outputIndex,
+        sequence_number: state.seq++
+    }));
+    await writeSseLine(res, JSON.stringify({
+        type: 'response.content_part.added',
+        part: { id: itemId + '_part0', type: 'output_text', text: '' },
+        item_id: itemId,
+        output_index: outputIndex,
+        content_index: 0,
+        sequence_number: state.seq++
+    }));
+    await writeSseLine(res, JSON.stringify({
+        type: 'response.output_text.delta',
+        delta: text,
+        item_id: itemId,
+        output_index: outputIndex,
+        content_index: 0,
+        sequence_number: state.seq++
+    }));
+    await writeSseLine(res, JSON.stringify({
+        type: 'response.output_text.done',
+        text,
+        item_id: itemId,
+        output_index: outputIndex,
+        content_index: 0,
+        sequence_number: state.seq++
+    }));
+    await writeSseLine(res, JSON.stringify({
+        type: 'response.content_part.done',
+        part: { id: itemId + '_part0', type: 'output_text', text },
+        item_id: itemId,
+        output_index: outputIndex,
+        content_index: 0,
+        sequence_number: state.seq++
+    }));
+    await writeSseLine(res, JSON.stringify({
+        type: 'response.output_item.done',
+        item: { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] },
+        output_index: outputIndex,
+        sequence_number: state.seq++
+    }));
+}
+
 // Build a Responses-API JSON object whose single message carries the given
 // text. Used to surface proxy-side errors (e.g. blacklisted/404 model) to the
 // non-streaming client as a normal assistant message instead of an opaque 500.
@@ -1551,6 +1650,7 @@ async function resolveHostedResponseCore(chatBody, sharedState, startRound) {
             total_tokens: 0
         }
     };
+    state.model = chatBody.model;
 
     for (let round = startRound; round < MAX_HOSTED_WEB_SEARCH_ROUNDS; round++) {
         const chatResp = await requestChatCompletionJson(workingChatBody);
@@ -1643,6 +1743,10 @@ async function processResponseIncremental(response, onDelta) {
         let buffer = '';
         let pendingCount = 0;
         let streamEnded = false;
+        // Deltas are executed one after another: two chunks that arrive in the
+        // same tick used to run concurrently, and their awaits could interleave
+        // so downstream events (e.g. reasoning summary deltas) came out reversed.
+        let tail = Promise.resolve();
 
         function checkComplete() {
             if (streamEnded && pendingCount === 0) {
@@ -1652,7 +1756,8 @@ async function processResponseIncremental(response, onDelta) {
 
         function enqueueDelta(delta) {
             pendingCount++;
-            onDelta(delta).then(
+            tail = tail.then(() => onDelta(delta));
+            tail.then(
                 () => { pendingCount--; checkComplete(); },
                 (err) => { reject(err); }
             );
@@ -1736,7 +1841,7 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
 
     await processResponseIncremental(response, async (delta) => {
         const reasoning = extractReasoningText(delta);
-        const textDelta = delta.content || '';
+        const textDelta = stripPrivateMarkup(delta.content || '');
         const tcDeltas = normalizeToolCalls(delta.tool_calls);
 
         // Log first few deltas to debug model output format
@@ -1777,34 +1882,38 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
                 reasonIndex = roundIndex;
                 reasonItemAdded = true;
                 const itemId = state.responseId + '_think_r' + roundIndex;
+                // Emit a native `reasoning` item so Codex renders the chain of
+                // thought in its own thinking style instead of as assistant text.
                 await writeSseLine(res, JSON.stringify({
                     type: 'response.output_item.added',
-                    item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
+                    item: { id: itemId, type: 'reasoning', summary: [] },
                     output_index: reasonIndex * 2,
                     sequence_number: state.seq++
                 }));
                 await writeSseLine(res, JSON.stringify({
-                    type: 'response.content_part.added',
-                    part: { id: itemId + '_part0', type: 'output_text', text: '' },
+                    type: 'response.reasoning_summary_part.added',
+                    part: { type: 'summary_text', text: '' },
                     item_id: itemId,
                     output_index: reasonIndex * 2,
-                    content_index: 0,
+                    summary_index: 0,
                     sequence_number: state.seq++
                 }));
             }
             await writeSseLine(res, JSON.stringify({
-                type: 'response.output_text.delta',
+                type: 'response.reasoning_summary_text.delta',
                 delta: reasoning,
                 item_id: state.responseId + '_think_r' + roundIndex,
                 output_index: reasonIndex * 2,
-                content_index: 0,
+                summary_index: 0,
                 sequence_number: state.seq++
             }));
         }
 
         if (textDelta && !tcDeltas.some(tc => tc.name === 'web_search')) {
             fullContent += textDelta;
-            if (!contentItemAdded) {
+            // A reply whose only content was model-internal markup leaves just
+            // whitespace behind — don't open a bubble for it.
+            if (!contentItemAdded && fullContent.trim()) {
                 contentIndex = roundIndex * 2 + 1;
                 contentItemAdded = true;
                 const itemId = state.responseId + '_msg_r' + roundIndex;
@@ -1823,14 +1932,16 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
                     sequence_number: state.seq++
                 }));
             }
-            await writeSseLine(res, JSON.stringify({
-                type: 'response.output_text.delta',
-                delta: textDelta,
-                item_id: state.responseId + '_msg_r' + roundIndex,
-                output_index: contentIndex,
-                content_index: 0,
-                sequence_number: state.seq++
-            }));
+            if (contentItemAdded) {
+                await writeSseLine(res, JSON.stringify({
+                    type: 'response.output_text.delta',
+                    delta: textDelta,
+                    item_id: state.responseId + '_msg_r' + roundIndex,
+                    output_index: contentIndex,
+                    content_index: 0,
+                    sequence_number: state.seq++
+                }));
+            }
         }
     });
 
@@ -1838,24 +1949,24 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
         log('STREAM_R' + roundIndex + ': reasonItemAdded, fullReasoning=' + fullReasoning.length + ' chars');
         const itemId = state.responseId + '_think_r' + roundIndex;
         await writeSseLine(res, JSON.stringify({
-            type: 'response.output_text.done',
+            type: 'response.reasoning_summary_text.done',
             text: fullReasoning,
             item_id: itemId,
             output_index: reasonIndex * 2,
-            content_index: 0,
+            summary_index: 0,
             sequence_number: state.seq++
         }));
         await writeSseLine(res, JSON.stringify({
-            type: 'response.content_part.done',
-            part: { id: itemId + '_part0', type: 'output_text', text: fullReasoning },
+            type: 'response.reasoning_summary_part.done',
+            part: { type: 'summary_text', text: fullReasoning },
             item_id: itemId,
             output_index: reasonIndex * 2,
-            content_index: 0,
+            summary_index: 0,
             sequence_number: state.seq++
         }));
         await writeSseLine(res, JSON.stringify({
             type: 'response.output_item.done',
-            item: { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: fullReasoning }] },
+            item: { id: itemId, type: 'reasoning', summary: [{ type: 'summary_text', text: fullReasoning }] },
             output_index: reasonIndex * 2,
             sequence_number: state.seq++
         }));
@@ -1994,6 +2105,18 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
         : { webSearchCalls: [], searchEvents: [] };
 
     if (webSearchCalls.length === 0) {
+        // Nothing the user can act on came back (no answer, no tool call) — e.g.
+        // the model emitted only its internal markup, which was stripped. Report
+        // it instead of completing a silently empty turn.
+        if (!contentItemAdded && externalToolCalls.length === 0) {
+            await writeAssistantMessageEvents(
+                res,
+                state.responseId + '_empty_r' + roundIndex,
+                emptyReplyText(state.model),
+                roundIndex * 2 + 1,
+                state
+            );
+        }
         await writeSseLine(res, JSON.stringify({
             type: 'response.completed',
             response: { id: state.responseId, status: 'completed', output: [] },
