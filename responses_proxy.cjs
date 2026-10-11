@@ -1075,13 +1075,12 @@ function normalizeToolCalls(toolCalls) {
     }));
 }
 
-function makeUsage(usage) {
-    if (!usage) return undefined;
-    return {
-        input_tokens: usage.prompt_tokens || 0,
-        output_tokens: usage.completion_tokens || 0,
-        total_tokens: usage.total_tokens || 0
-    };
+// Codex reads token counts from the Responses `usage` object, while NIM reports
+// them in Chat-Completions shape (prompt/completion plus nested details). Keep a
+// running total and translate it at the end so the numbers — including the
+// cached and reasoning sub-counts the CLI shows — match a native session.
+function emptyUsageTotals() {
+    return { input_tokens: 0, output_tokens: 0, total_tokens: 0, cached_tokens: 0, reasoning_tokens: 0 };
 }
 
 function addUsageTotals(totals, usage) {
@@ -1089,6 +1088,31 @@ function addUsageTotals(totals, usage) {
     totals.input_tokens += usage.prompt_tokens || 0;
     totals.output_tokens += usage.completion_tokens || 0;
     totals.total_tokens += usage.total_tokens || 0;
+    totals.cached_tokens += (usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens) || 0;
+    totals.reasoning_tokens += (usage.completion_tokens_details && usage.completion_tokens_details.reasoning_tokens) || 0;
+}
+
+function usageFromTotals(totals) {
+    if (!totals || totals.total_tokens <= 0) return undefined;
+    const usage = {
+        input_tokens: totals.input_tokens,
+        output_tokens: totals.output_tokens,
+        total_tokens: totals.total_tokens
+    };
+    if (totals.cached_tokens > 0) {
+        usage.input_tokens_details = { cached_tokens: totals.cached_tokens };
+    }
+    if (totals.reasoning_tokens > 0) {
+        usage.output_tokens_details = { reasoning_tokens: totals.reasoning_tokens };
+    }
+    return usage;
+}
+
+function nimUsageToResponse(usage) {
+    if (!usage) return undefined;
+    const totals = emptyUsageTotals();
+    addUsageTotals(totals, usage);
+    return usageFromTotals(totals);
 }
 
 function cloneToolCallForMessage(tc) {
@@ -1157,7 +1181,7 @@ function buildResponseObjectFromState(state) {
         object: 'response',
         status: 'completed',
         output,
-        usage: state.usageTotals.total_tokens > 0 ? state.usageTotals : undefined
+        usage: usageFromTotals(state.usageTotals)
     };
 }
 
@@ -1193,7 +1217,7 @@ async function resolveHostedResponseStreaming(res, chatBody) {
         searchEvents: [],
         functionCalls: [],
         answerText: '',
-        usageTotals: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+        usageTotals: emptyUsageTotals(),
         seq: 0,
         clientGone: false,
         upstream: null,
@@ -1236,6 +1260,9 @@ async function resolveHostedResponseStreaming(res, chatBody) {
 
     const workingChatBody = JSON.parse(JSON.stringify(chatBody));
     workingChatBody.stream = true;
+    // Ask NIM to attach token usage to the final stream chunk, so the proxy can
+    // report real counts in `response.completed` instead of leaving them at zero.
+    workingChatBody.stream_options = { include_usage: true };
     workingChatBody.messages = Array.isArray(workingChatBody.messages) ? workingChatBody.messages : [];
 
     let firstRoundResult;
@@ -1431,7 +1458,7 @@ async function resolveHostedResponseStreaming(res, chatBody) {
 
     await writeSseLine(res, JSON.stringify({
         type: 'response.completed',
-        response: { id: tempState.responseId, status: 'completed', output: [] },
+        response: { id: tempState.responseId, status: 'completed', output: [], usage: usageFromTotals(tempState.usageTotals) },
         sequence_number: tempState.seq++
     }));
     await writeSseRaw(res, 'data: [DONE]\n\n');
@@ -1644,11 +1671,7 @@ async function resolveHostedResponseCore(chatBody, sharedState, startRound) {
         searchEvents: [],
         functionCalls: [],
         answerText: '',
-        usageTotals: {
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0
-        }
+        usageTotals: emptyUsageTotals()
     };
     state.model = chatBody.model;
 
@@ -1754,9 +1777,9 @@ async function processResponseIncremental(response, onDelta) {
             }
         }
 
-        function enqueueDelta(delta) {
+        function enqueueDelta(delta, usage) {
             pendingCount++;
-            tail = tail.then(() => onDelta(delta));
+            tail = tail.then(() => onDelta(delta, usage));
             tail.then(
                 () => { pendingCount--; checkComplete(); },
                 (err) => { reject(err); }
@@ -1775,7 +1798,7 @@ async function processResponseIncremental(response, onDelta) {
                 let parsed;
                 try { parsed = JSON.parse(data); } catch (e) { continue; }
                 const delta = (parsed.choices && parsed.choices[0] && parsed.choices[0].delta) || {};
-                enqueueDelta(delta);
+                enqueueDelta(delta, parsed.usage);
             }
         });
         response.on('end', () => {
@@ -1785,7 +1808,7 @@ async function processResponseIncremental(response, onDelta) {
                 try { parsed = JSON.parse(trimmed.slice(6).trim()); } catch (e) {}
                 if (parsed) {
                     const delta = (parsed.choices && parsed.choices[0] && parsed.choices[0].delta) || {};
-                    enqueueDelta(delta);
+                    enqueueDelta(delta, parsed.usage);
                 }
             }
             streamEnded = true;
@@ -1839,7 +1862,8 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
 
     log('STREAM_R' + roundIndex + ': starting to process incremental response');
 
-    await processResponseIncremental(response, async (delta) => {
+    await processResponseIncremental(response, async (delta, usage) => {
+        if (usage) addUsageTotals(state.usageTotals, usage);
         const reasoning = extractReasoningText(delta);
         const textDelta = stripPrivateMarkup(delta.content || '');
         const tcDeltas = normalizeToolCalls(delta.tool_calls);
@@ -2036,7 +2060,7 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
         }
         await writeSseLine(res, JSON.stringify({
             type: 'response.completed',
-            response: { id: state.responseId, status: 'completed', output: [] },
+            response: { id: state.responseId, status: 'completed', output: [], usage: usageFromTotals(state.usageTotals) },
             sequence_number: state.seq++
         }));
         await writeSseRaw(res, 'data: [DONE]\n\n');
@@ -2119,7 +2143,7 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
         }
         await writeSseLine(res, JSON.stringify({
             type: 'response.completed',
-            response: { id: state.responseId, status: 'completed', output: [] },
+            response: { id: state.responseId, status: 'completed', output: [], usage: usageFromTotals(state.usageTotals) },
             sequence_number: state.seq++
         }));
         await writeSseRaw(res, 'data: [DONE]\n\n');
@@ -2354,7 +2378,8 @@ async function streamResponseObject(res, responseObject, skipHeader) {
         response: {
             id: responseObject.id,
             status: 'completed',
-            output: responseObject.output
+            output: responseObject.output,
+            usage: responseObject.usage
         }
     });
 
@@ -2455,11 +2480,7 @@ function buildNonStreamResponse(chatResp) {
         object: 'response',
         status: 'completed',
         output,
-        usage: chatResp.usage ? {
-            input_tokens: chatResp.usage.prompt_tokens || 0,
-            output_tokens: chatResp.usage.completion_tokens || 0,
-            total_tokens: chatResp.usage.total_tokens || 0
-        } : undefined
+        usage: nimUsageToResponse(chatResp.usage)
     };
 }
 
