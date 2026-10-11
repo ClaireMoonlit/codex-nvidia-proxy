@@ -160,10 +160,10 @@ function writeModelCatalog(models) {
         let list = (models && models.length > 0) ? models : (MODELS.length > 0 ? MODELS : BUILTIN_MODELS);
         // Drop blacklisted models (e.g. returned 404 / unavailable for this
         // account) so the desktop picker and CLI `/model` don't keep offering them.
-        list = list.filter(m => m && !BLACKLISTED_MODELS.has(m.id));
+        list = list.filter(m => m && !isBlacklisted(m.id));
         // Ensure the currently-selected model is present, otherwise Codex won't
         // find a matching slug and silently drops tools.
-        if (currentModel && !BLACKLISTED_MODELS.has(currentModel) && !list.some(x => x.id === currentModel)) {
+        if (currentModel && !isBlacklisted(currentModel) && !list.some(x => x.id === currentModel)) {
             list = [{ id: currentModel, name: currentModel, desc: '' }].concat(list);
         }
         const data = list.map(m => {
@@ -239,30 +239,63 @@ function loadModelsFromFile() {
     return [];
 }
 
+// A model that returns 404 is not necessarily gone for good: NIM lists models it
+// will not serve for a given account, and availability can change. Remember the
+// rejection for a bounded window instead of banning the model forever, so a
+// temporarily unavailable model becomes selectable again on its own.
+const BLACKLIST_TTL_MS = 24 * 60 * 60 * 1000;
+
 function loadBlacklist() {
+    const entries = new Map();
     try {
         if (fs.existsSync(MODEL_BLACKLIST_PATH)) {
-            return new Set(JSON.parse(fs.readFileSync(MODEL_BLACKLIST_PATH, 'utf-8')));
+            const raw = JSON.parse(fs.readFileSync(MODEL_BLACKLIST_PATH, 'utf-8'));
+            const now = Date.now();
+            if (Array.isArray(raw)) {
+                // Legacy format: a plain list with no timestamps. Keep each entry
+                // for one more TTL window instead of dropping it outright.
+                for (const id of raw) {
+                    if (typeof id === 'string') entries.set(id, now + BLACKLIST_TTL_MS);
+                }
+            } else if (raw && typeof raw === 'object') {
+                for (const [id, expiresAt] of Object.entries(raw)) {
+                    if (typeof expiresAt === 'number' && expiresAt > now) entries.set(id, expiresAt);
+                }
+            }
         }
     } catch (e) {
         console.warn('[Proxy] Failed to load blacklist:', e.message);
     }
-    return new Set();
+    return entries;
 }
 
 function saveBlacklist(blacklist) {
     try {
-        fs.writeFileSync(MODEL_BLACKLIST_PATH, JSON.stringify([...blacklist], null, 2), 'utf-8');
+        fs.writeFileSync(MODEL_BLACKLIST_PATH, JSON.stringify(Object.fromEntries(blacklist), null, 2) + '\n', 'utf-8');
     } catch (e) {
         console.warn('[Proxy] Failed to save blacklist:', e.message);
     }
 }
 
-function blacklistModel(modelId) {
-    if (!BLACKLISTED_MODELS.has(modelId)) {
-        BLACKLISTED_MODELS.add(modelId);
+// Expiry is checked on read, so a model whose window has passed becomes usable
+// again without restarting the proxy.
+function isBlacklisted(modelId) {
+    const expiresAt = BLACKLISTED_MODELS.get(modelId);
+    if (expiresAt === undefined) return false;
+    if (expiresAt <= Date.now()) {
+        BLACKLISTED_MODELS.delete(modelId);
         saveBlacklist(BLACKLISTED_MODELS);
-        console.warn('[Proxy] Blacklisted model:', modelId);
+        console.warn('[Proxy] Blacklist expired, model available again:', modelId);
+        return false;
+    }
+    return true;
+}
+
+function blacklistModel(modelId) {
+    if (!isBlacklisted(modelId)) {
+        BLACKLISTED_MODELS.set(modelId, Date.now() + BLACKLIST_TTL_MS);
+        saveBlacklist(BLACKLISTED_MODELS);
+        console.warn('[Proxy] Blacklisted model for 24h:', modelId);
         // Rewrite the catalog so the desktop picker / CLI `/model` stop
         // offering the blacklisted model immediately (they read the catalog
         // file on disk, not the in-memory list).
@@ -2539,7 +2572,7 @@ const proxyServer = http.createServer(async (req, res) => {
                 // Pre-flight: a blacklisted model can never succeed — NIM already
                 // returned 404 for it before. Answer with a clear message instead
                 // of round-tripping to NIM and waiting for another 404.
-                if (BLACKLISTED_MODELS.has(chatBody.model)) {
+                if (isBlacklisted(chatBody.model)) {
                     const errText = errorReply('NIM proxy: model unavailable',
                         'Model "' + chatBody.model + '" was removed from your model list earlier (NIM does not serve it). Switch to another model.');
                     log('Pre-flight blacklist rejection:', chatBody.model);
