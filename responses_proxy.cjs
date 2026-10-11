@@ -1135,7 +1135,8 @@ function buildResponseObjectFromState(state) {
         output.push({
             type: 'reasoning',
             id: responseId + '_think',
-            summary: [{ type: 'summary_text', text: combinedReasoning }]
+            summary: [],
+            content: [{ type: 'reasoning_text', text: combinedReasoning }]
         });
     }
 
@@ -1318,49 +1319,33 @@ async function resolveHostedResponseStreaming(res, chatBody) {
         // Native `reasoning` item, same shape the round-0 stream emits.
         await writeSseLine(res, JSON.stringify({
             type: 'response.output_item.added',
-            item: { id: itemId, type: 'reasoning', summary: [] },
+            item: { id: itemId, type: 'reasoning', summary: [], content: [] },
             output_index: reasonIdx,
-            sequence_number: tempState.seq++
-        }));
-        await writeSseLine(res, JSON.stringify({
-            type: 'response.reasoning_summary_part.added',
-            part: { type: 'summary_text', text: '' },
-            item_id: itemId,
-            output_index: reasonIdx,
-            summary_index: 0,
             sequence_number: tempState.seq++
         }));
         const chunks = splitTextIntoChunks(combinedNewReasoning, 40);
         for (const chunk of chunks) {
             await writeSseLine(res, JSON.stringify({
-                type: 'response.reasoning_summary_text.delta',
+                type: 'response.reasoning_text.delta',
                 delta: chunk,
                 item_id: itemId,
                 output_index: reasonIdx,
-                summary_index: 0,
+                content_index: 0,
                 sequence_number: tempState.seq++
             }));
             await new Promise(r => setTimeout(r, 15));
         }
         await writeSseLine(res, JSON.stringify({
-            type: 'response.reasoning_summary_text.done',
+            type: 'response.reasoning_text.done',
             text: combinedNewReasoning,
             item_id: itemId,
             output_index: reasonIdx,
-            summary_index: 0,
-            sequence_number: tempState.seq++
-        }));
-        await writeSseLine(res, JSON.stringify({
-            type: 'response.reasoning_summary_part.done',
-            part: { type: 'summary_text', text: combinedNewReasoning },
-            item_id: itemId,
-            output_index: reasonIdx,
-            summary_index: 0,
+            content_index: 0,
             sequence_number: tempState.seq++
         }));
         await writeSseLine(res, JSON.stringify({
             type: 'response.output_item.done',
-            item: { id: itemId, type: 'reasoning', summary: [{ type: 'summary_text', text: combinedNewReasoning }] },
+            item: { id: itemId, type: 'reasoning', summary: [], content: [{ type: 'reasoning_text', text: combinedNewReasoning }] },
             output_index: reasonIdx,
             sequence_number: tempState.seq++
         }));
@@ -1908,27 +1893,23 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
                 const itemId = state.responseId + '_think_r' + roundIndex;
                 // Emit a native `reasoning` item so Codex renders the chain of
                 // thought in its own thinking style instead of as assistant text.
+                // The text is sent as raw `reasoning_text` (not a summary): NIM
+                // streams the model's real chain of thought and
+                // `show_raw_agent_reasoning` is on, so this matches the shape the
+                // official DeepSeek/third-party Responses integrations use.
                 await writeSseLine(res, JSON.stringify({
                     type: 'response.output_item.added',
-                    item: { id: itemId, type: 'reasoning', summary: [] },
+                    item: { id: itemId, type: 'reasoning', summary: [], content: [] },
                     output_index: reasonIndex * 2,
-                    sequence_number: state.seq++
-                }));
-                await writeSseLine(res, JSON.stringify({
-                    type: 'response.reasoning_summary_part.added',
-                    part: { type: 'summary_text', text: '' },
-                    item_id: itemId,
-                    output_index: reasonIndex * 2,
-                    summary_index: 0,
                     sequence_number: state.seq++
                 }));
             }
             await writeSseLine(res, JSON.stringify({
-                type: 'response.reasoning_summary_text.delta',
+                type: 'response.reasoning_text.delta',
                 delta: reasoning,
                 item_id: state.responseId + '_think_r' + roundIndex,
                 output_index: reasonIndex * 2,
-                summary_index: 0,
+                content_index: 0,
                 sequence_number: state.seq++
             }));
         }
@@ -1973,24 +1954,16 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
         log('STREAM_R' + roundIndex + ': reasonItemAdded, fullReasoning=' + fullReasoning.length + ' chars');
         const itemId = state.responseId + '_think_r' + roundIndex;
         await writeSseLine(res, JSON.stringify({
-            type: 'response.reasoning_summary_text.done',
+            type: 'response.reasoning_text.done',
             text: fullReasoning,
             item_id: itemId,
             output_index: reasonIndex * 2,
-            summary_index: 0,
-            sequence_number: state.seq++
-        }));
-        await writeSseLine(res, JSON.stringify({
-            type: 'response.reasoning_summary_part.done',
-            part: { type: 'summary_text', text: fullReasoning },
-            item_id: itemId,
-            output_index: reasonIndex * 2,
-            summary_index: 0,
+            content_index: 0,
             sequence_number: state.seq++
         }));
         await writeSseLine(res, JSON.stringify({
             type: 'response.output_item.done',
-            item: { id: itemId, type: 'reasoning', summary: [{ type: 'summary_text', text: fullReasoning }] },
+            item: { id: itemId, type: 'reasoning', summary: [], content: [{ type: 'reasoning_text', text: fullReasoning }] },
             output_index: reasonIndex * 2,
             sequence_number: state.seq++
         }));
