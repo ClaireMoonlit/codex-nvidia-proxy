@@ -1221,6 +1221,9 @@ function buildResponseObjectFromState(state) {
 
 async function requestChatCompletionJson(chatBody) {
     const requestBody = { ...chatBody, stream: false };
+    // `stream_options` is only valid alongside `stream: true`; a non-streaming
+    // request that still carries it is rejected by NIM (HTTP 400).
+    delete requestBody.stream_options;
     const result = await forwardRequestWithRetry(null, JSON.stringify(requestBody));
     const raw = await readIncomingMessage(result.response);
 
@@ -1681,6 +1684,10 @@ async function resolveHostedResponseCore(chatBody, sharedState, startRound) {
     const MAX_HOSTED_WEB_SEARCH_ROUNDS = 6;
     const workingChatBody = JSON.parse(JSON.stringify(chatBody));
     workingChatBody.stream = false;
+    // The hosted-search follow-up rounds are non-streaming, so drop the
+    // `stream_options` the streaming round added — NIM rejects it with a 400
+    // when `stream` is false.
+    delete workingChatBody.stream_options;
     workingChatBody.messages = Array.isArray(workingChatBody.messages) ? workingChatBody.messages : [];
 
     const state = sharedState || {
