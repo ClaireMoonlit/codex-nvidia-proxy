@@ -894,6 +894,7 @@ function convertRequest(responsesBody) {
 
 function forwardRequest(req, bodyStr) {
     return new Promise((resolve, reject) => {
+        const start = Date.now();
         const options = {
             hostname: NVIDIA_HOST,
             port: 443,
@@ -909,7 +910,8 @@ function forwardRequest(req, bodyStr) {
         log('Forwarding to NVIDIA, body length:', bodyStr.length);
 
         const proxyReq = https.request(options, (proxyRes) => {
-            log('NVIDIA response received, status:', proxyRes.statusCode);
+            // TTFB 观测：大上下文时这段是"排队 + prefill"，是请求耗时的大头
+            log('NVIDIA response received, status:', proxyRes.statusCode, 'ttfb:', (Date.now() - start) + 'ms');
             resolve({ stream: true, response: proxyRes });
         });
 
@@ -1709,9 +1711,9 @@ async function processResponseIncremental(response, onDelta) {
             }
         }
 
-        function enqueueDelta(delta, usage) {
+        function enqueueDelta(delta, usage, finishReason) {
             pendingCount++;
-            tail = tail.then(() => onDelta(delta, usage));
+            tail = tail.then(() => onDelta(delta, usage, finishReason));
             tail.then(
                 () => { pendingCount--; checkComplete(); },
                 (err) => { reject(err); }
@@ -1729,8 +1731,9 @@ async function processResponseIncremental(response, onDelta) {
                 if (data === '[DONE]') continue;
                 let parsed;
                 try { parsed = JSON.parse(data); } catch (e) { continue; }
-                const delta = (parsed.choices && parsed.choices[0] && parsed.choices[0].delta) || {};
-                enqueueDelta(delta, parsed.usage);
+                const choice = (parsed.choices && parsed.choices[0]) || {};
+                const delta = choice.delta || {};
+                enqueueDelta(delta, parsed.usage, choice.finish_reason || null);
             }
         });
         response.on('end', () => {
@@ -1780,6 +1783,7 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
 
     let fullContent = '';
     let fullReasoning = '';
+    let finishReason = null;
     let webSearchCalls = [];
     let searchEvents = [];
     const wsCallMap = new Map();
@@ -1798,8 +1802,12 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
 
     log('STREAM_R' + roundIndex + ': starting to process incremental response');
 
-    await processResponseIncremental(response, async (delta, usage) => {
+    await processResponseIncremental(response, async (delta, usage, finish) => {
         if (usage) addUsageTotals(state.usageTotals, usage);
+        // 记录上游停止原因：stop=模型自己停完；tool_calls=要调工具（进入下一轮）；
+        // length=输出被截断——截断时模型可能"话没说完、工具没发全"，必须如实上报
+        // incomplete，否则 Codex 会把一次被掐断的回合当成正常完成。
+        if (finish) finishReason = finish;
         const reasoning = extractReasoningText(delta);
         const textDelta = stripPrivateMarkup(delta.content || '');
         const tcDeltas = normalizeToolCalls(delta.tool_calls);
@@ -2024,9 +2032,20 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
         }
         await writeSseLine(res, JSON.stringify({
             type: 'response.completed',
-            response: { id: state.responseId, status: 'completed', output: [], usage: usageFromTotals(state.usageTotals) },
+            response: finishReason === 'length'
+                ? {
+                    id: state.responseId,
+                    // 上游按长度截断：如实上报 incomplete，Codex 才不会把
+                    // "话没说完、工具没发全"的回合当成正常完成。
+                    status: 'incomplete',
+                    incomplete_details: { reason: 'max_output_tokens' },
+                    output: [],
+                    usage: usageFromTotals(state.usageTotals)
+                }
+                : { id: state.responseId, status: 'completed', output: [], usage: usageFromTotals(state.usageTotals) },
             sequence_number: state.seq++
         }));
+        log('STREAM_R' + roundIndex + ': finished, finish_reason=' + finishReason + ', content=' + fullContent.length + 'ch, reasoning=' + fullReasoning.length + 'ch');
         await writeSseRaw(res, 'data: [DONE]\n\n');
         state.nextSlot = nextSlot;
         return null;
