@@ -349,6 +349,25 @@ function log(...args) {
     }
 }
 
+// 崩溃兜底：代理以裸进程方式跑在用户终端里，任何未捕获异常都会无声退出，
+// 连尸检报告都没有。这里把 uncaughtException / unhandledRejection 连堆栈写进
+// proxy-crash.log 再退出——"代理自己死了"必须变成可诊断的事件。
+// （Node 15+ 对未处理的 rejection 默认就是崩溃，这里保持等价行为，只是留档。）
+function recordCrash(kind, err) {
+    const detail = (err && (err.stack || err.message)) || String(err);
+    try {
+        const fs = require('fs');
+        const path = require('path');
+        fs.appendFileSync(
+            path.join(__dirname, 'proxy-crash.log'),
+            '[' + new Date().toISOString() + '] ' + kind + ':\n' + detail + '\n\n'
+        );
+    } catch (e) {}
+    console.error('[Proxy] FATAL ' + kind + ' (also written to proxy-crash.log):\n' + detail);
+}
+process.on('uncaughtException', (err) => { recordCrash('uncaughtException', err); process.exit(1); });
+process.on('unhandledRejection', (reason) => { recordCrash('unhandledRejection', reason); process.exit(1); });
+
 let currentModel = getCurrentModelFromFile();
 
 stripProxyConfig();
