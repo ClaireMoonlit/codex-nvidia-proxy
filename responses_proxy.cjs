@@ -1321,9 +1321,9 @@ async function resolveHostedResponseStreaming(res, chatBody) {
         clearInterval(heartbeat);
         throw e;
     }
-    log('STREAM_MAIN: firstRoundResult=' + (firstRoundResult ? ('wsCalls=' + firstRoundResult.webSearchCalls.length + ', seEvents=' + firstRoundResult.searchEvents.length) : 'null'));
+    log('STREAM_MAIN: firstRoundResult=' + (firstRoundResult ? ('wsCalls=' + firstRoundResult.webSearchCalls.length + ', seEvents=' + firstRoundResult.searchEvents.length) : (tempState.streamFailed ? 'failed' : 'null')));
     if (!firstRoundResult) {
-        log('STREAM_MAIN: first round returned null (external tool calls), finishing');
+        log('STREAM_MAIN: first round returned null (' + (tempState.streamFailed ? 'response failed' : 'external tool calls') + '), finishing');
         clearInterval(heartbeat);
         await finishSseIfOpen(res);
         return;
@@ -1357,8 +1357,9 @@ async function resolveHostedResponseStreaming(res, chatBody) {
             roundResult = await streamSingleRound(res, roundBody, tempState, round);
 
             if (!roundResult) {
-                // 这一轮把外部工具调用交还给了 Codex，回合已在 streamSingleRound 里收尾。
-                log('STREAM_MAIN: round ' + round + ' handed external tool calls back to Codex');
+                // 这一轮把外部工具调用交还给了 Codex，或已发 response.failed 终止；
+                // 两种情况回合都在 streamSingleRound 里收尾了。
+                log('STREAM_MAIN: round ' + round + ' ended the stream (' + (tempState.streamFailed ? 'response failed' : 'external tool calls') + ')');
                 return;
             }
 
@@ -1407,6 +1408,63 @@ function finishSseIfOpen(res) {
 // keeps them visually distinct from real model replies.
 function errorReply(title, detail) {
     return '> **' + title + '**\n>\n> ' + detail;
+}
+
+// Structured single-line failure description, in the shape of a system log:
+// "NIM proxy failed while handling /responses. Provider: NVIDIA NIM; model:
+// <m>; upstream_status: HTTP <n>; cause: <...>. <advice>". Rendered by Codex
+// as its native error card (via response.failed / HTTP error status), so the
+// wording stays machine-formal rather than sounding like a model reply.
+// statusCode 0 means "never got a response" (network failure after retries).
+function upstreamErrorDetail(statusCode, err, model) {
+    const raw = ((err && err.message) || 'unknown error').replace(/\s+/g, ' ').trim();
+    let cause;
+    let advice;
+    if (statusCode === 404) {
+        cause = 'NVIDIA NIM does not serve "' + (model || '') + '" for this account (removed from the model list)';
+        advice = 'Switch to another model.';
+    } else if (statusCode === 402) {
+        cause = 'the free quota for this NVIDIA account is used up';
+        advice = 'Use a different API key or a paid endpoint — switching models will not help.';
+    } else if (statusCode === 401 || statusCode === 403) {
+        cause = 'NVIDIA refused the API key';
+        advice = 'Check NVIDIA_API_KEY in .env and restart the proxy.';
+    } else if (statusCode === 429) {
+        cause = 'NVIDIA is throttling this key (free tier RPM limit)';
+        advice = 'Wait a moment and retry, or switch to another model.';
+    } else if (statusCode === 500 && !(err && err.body)) {
+        cause = 'internal proxy error: ' + raw;
+        advice = 'This is a bug in the proxy itself — restart it; if it keeps happening, please report the message above.';
+    } else if (statusCode >= 500) {
+        cause = 'NVIDIA returned a server error: ' + raw;
+        advice = 'Try again in a moment, or switch models.';
+    } else if (statusCode === 0) {
+        cause = 'upstream unreachable after retries: ' + raw;
+        advice = 'Check network connectivity, then retry.';
+    } else {
+        cause = 'upstream error: ' + raw;
+        advice = 'Try again or switch models.';
+    }
+    return 'NIM proxy failed while handling /responses. Provider: NVIDIA NIM; model: '
+        + (model || 'unknown') + '; upstream_status: HTTP ' + (statusCode || 'unreachable')
+        + '; cause: ' + cause + '. ' + advice;
+}
+
+// Terminate a streaming turn with the Responses protocol's failure event so
+// the client renders its own native error UI. Codex maps response.failed to
+// an error card showing error.message; it does not render type:'error' SSE
+// events, and a fake assistant message hides the failure from the client.
+async function emitResponseFailed(res, responseId, seqRef, message) {
+    await writeSseLine(res, JSON.stringify({
+        type: 'response.failed',
+        response: {
+            id: responseId,
+            status: 'failed',
+            error: { code: 'nim_proxy_error', message }
+        },
+        sequence_number: seqRef.seq++
+    }));
+    await writeSseRaw(res, 'data: [DONE]\n\n');
 }
 
 // Turn a failed upstream request into an alert reply. 404 means the model is
@@ -1498,24 +1556,6 @@ async function writeAssistantMessageEvents(res, itemId, text, outputIndex, state
         output_index: outputIndex,
         sequence_number: state.seq++
     }));
-}
-
-// Build a Responses-API JSON object whose single message carries the given
-// text. Used to surface proxy-side errors (e.g. blacklisted/404 model) to the
-// non-streaming client as a normal assistant message instead of an opaque 500.
-function buildMessageResponseObject(responseId, text) {
-    return {
-        id: responseId,
-        object: 'response',
-        status: 'completed',
-        output: [{
-            type: 'message',
-            id: responseId + '_msg',
-            role: 'assistant',
-            status: 'completed',
-            content: [{ type: 'output_text', text }]
-        }]
-    };
 }
 
 // Emit a standard Responses streaming event sequence that renders `text` as a
@@ -1762,7 +1802,17 @@ async function processResponseIncremental(response, onDelta) {
 
 async function streamSingleRound(res, chatBody, state, roundIndex) {
     const bodyStr = JSON.stringify(chatBody);
-    const result = await forwardRequestWithRetry(null, bodyStr);
+    let result;
+    try {
+        result = await forwardRequestWithRetry(null, bodyStr);
+    } catch (e) {
+        // 重试耗尽仍连不上上游：发 response.failed 让 Codex 渲染原生错误卡片，
+        // 而不是把网络故障伪装成一条模型回复。
+        log('STREAM_R' + roundIndex + ': upstream unreachable after retries:', e.message);
+        state.streamFailed = true;
+        await emitResponseFailed(res, state.responseId, state, upstreamErrorDetail(0, e, chatBody.model));
+        return null;
+    }
     const response = result.response;
     const statusCode = response.statusCode || 200;
 
@@ -1775,10 +1825,11 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
 
     if (statusCode !== 200) {
         const raw = await readIncomingMessage(response);
-        const err = new Error('NVIDIA NIM returned ' + statusCode);
-        err.statusCode = statusCode;
-        err.body = raw;
-        throw err;
+        log('STREAM_R' + roundIndex + ': upstream HTTP ' + statusCode + ', body:', (raw || '').substring(0, 300));
+        if (statusCode === 404) blacklistModel(chatBody.model);
+        state.streamFailed = true;
+        await emitResponseFailed(res, state.responseId, state, upstreamErrorDetail(statusCode, { message: raw, body: raw }, chatBody.model));
+        return null;
     }
 
     let fullContent = '';
@@ -2549,11 +2600,11 @@ const proxyServer = http.createServer(async (req, res) => {
                 const isStream = responsesBody.stream === true;
 
                 // Pre-flight: a blacklisted model can never succeed — NIM already
-                // returned 404 for it before. Answer with a clear message instead
-                // of round-tripping to NIM and waiting for another 404.
+                // returned 404 for it before. Fail natively instead of round-tripping
+                // to NIM and waiting for another 404.
                 if (isBlacklisted(chatBody.model)) {
-                    const errText = errorReply('NIM proxy: model unavailable',
-                        'Model "' + chatBody.model + '" was removed from your model list earlier (NIM does not serve it). Switch to another model.');
+                    const failId = 'resp_blacklisted_' + Date.now();
+                    const failMsg = upstreamErrorDetail(404, { message: 'model is on the proxy blacklist (NIM does not serve it)' }, chatBody.model);
                     log('Pre-flight blacklist rejection:', chatBody.model);
                     if (isStream) {
                         res.writeHead(200, {
@@ -2562,10 +2613,21 @@ const proxyServer = http.createServer(async (req, res) => {
                             'Connection': 'keep-alive'
                         });
                         if (res.socket) res.socket.setNoDelay(true);
-                        await emitAssistantTextAndComplete(res, 'resp_blacklisted_' + Date.now(), errText, false);
+                        const seqRef = { seq: 0 };
+                        await writeSseLine(res, JSON.stringify({
+                            type: 'response.created',
+                            response: { id: failId, status: 'in_progress', output: [] },
+                            sequence_number: seqRef.seq++
+                        }));
+                        await writeSseLine(res, JSON.stringify({
+                            type: 'response.in_progress',
+                            response: { id: failId, status: 'in_progress', output: [] },
+                            sequence_number: seqRef.seq++
+                        }));
+                        await emitResponseFailed(res, failId, seqRef, failMsg);
                     } else {
-                        res.writeHead(200, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify(buildMessageResponseObject('resp_blacklisted_' + Date.now(), errText)));
+                        res.writeHead(404, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ error: { code: 'nim_proxy_error', message: failMsg } }));
                     }
                     return;
                 }
@@ -2577,7 +2639,11 @@ const proxyServer = http.createServer(async (req, res) => {
                     } catch (e) {
                         const statusCode = e.statusCode || 500;
                         if (statusCode === 404) blacklistModel(chatBody.model);
-                        resp = buildMessageResponseObject('resp_error_' + Date.now(), upstreamErrorReply(statusCode, e, chatBody.model));
+                        // 上游失败直通 HTTP 状态码 + 结构化错误体，而不是 200 + 伪装成
+                        // 正常回复——非流式客户端（含 Codex compact 等）能看到真实失败。
+                        res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ error: { code: 'nim_proxy_error', message: upstreamErrorDetail(statusCode, e, chatBody.model) } }));
+                        return;
                     }
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify(resp));
