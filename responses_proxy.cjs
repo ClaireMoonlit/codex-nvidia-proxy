@@ -349,24 +349,35 @@ function log(...args) {
     }
 }
 
-// 崩溃兜底：代理以裸进程方式跑在用户终端里，任何未捕获异常都会无声退出，
-// 连尸检报告都没有。这里把 uncaughtException / unhandledRejection 连堆栈写进
-// proxy-crash.log 再退出——"代理自己死了"必须变成可诊断的事件。
+// 存亡兜底：代理以裸进程方式跑在用户终端里，"它怎么没的"必须能查。
+// proxy-crash.log 记录进程一生中的全部存亡事件——启动 START、收到信号 SIGNAL、
+// 退出 EXIT（带退出码与存活时长），以及 uncaughtException / unhandledRejection
+// 的完整堆栈。appendFileSync 是同步写，进程即将消失的那一刻也能落盘。
+// 判读方式：有 START 无 EXIT = 被硬杀（关终端窗口 / SIGKILL）；
+// 有 SIGNAL = Ctrl+C 之类；只有 EXIT code=0 = 正常收尾。
 // （Node 15+ 对未处理的 rejection 默认就是崩溃，这里保持等价行为，只是留档。）
-function recordCrash(kind, err) {
-    const detail = (err && (err.stack || err.message)) || String(err);
+const CRASH_LOG_PATH = require('path').join(__dirname, 'proxy-crash.log');
+const PROCESS_STARTED_AT = Date.now();
+function appendCrashLog(line) {
     try {
         const fs = require('fs');
-        const path = require('path');
-        fs.appendFileSync(
-            path.join(__dirname, 'proxy-crash.log'),
-            '[' + new Date().toISOString() + '] ' + kind + ':\n' + detail + '\n\n'
-        );
+        // 正常启停也会写日志，加个尺寸上限，避免长期反复重启把文件撑成巨型。
+        try { if (fs.statSync(CRASH_LOG_PATH).size > 256 * 1024) fs.unlinkSync(CRASH_LOG_PATH); } catch (e) {}
+        fs.appendFileSync(CRASH_LOG_PATH, line);
     } catch (e) {}
+}
+function recordCrash(kind, err) {
+    const detail = (err && (err.stack || err.message)) || String(err);
+    appendCrashLog('[' + new Date().toISOString() + '] ' + kind + ' pid=' + process.pid + ':\n' + detail + '\n\n');
     console.error('[Proxy] FATAL ' + kind + ' (also written to proxy-crash.log):\n' + detail);
 }
 process.on('uncaughtException', (err) => { recordCrash('uncaughtException', err); process.exit(1); });
 process.on('unhandledRejection', (reason) => { recordCrash('unhandledRejection', reason); process.exit(1); });
+appendCrashLog('[' + new Date().toISOString() + '] START pid=' + process.pid + ' node=' + process.version + '\n');
+process.on('SIGINT', () => { appendCrashLog('[' + new Date().toISOString() + '] SIGNAL SIGINT pid=' + process.pid + ' (Ctrl+C)\n'); process.exit(130); });
+process.on('SIGTERM', () => { appendCrashLog('[' + new Date().toISOString() + '] SIGNAL SIGTERM pid=' + process.pid + '\n'); process.exit(143); });
+// 退出码/时长与 START 配对即可还原进程一生（崩溃路径也会走到这里，因为崩溃处理里同样 process.exit）。
+process.on('exit', (code) => { appendCrashLog('[' + new Date().toISOString() + '] EXIT code=' + code + ' pid=' + process.pid + ' uptime=' + Math.round((Date.now() - PROCESS_STARTED_AT) / 1000) + 's\n'); });
 
 let currentModel = getCurrentModelFromFile();
 
