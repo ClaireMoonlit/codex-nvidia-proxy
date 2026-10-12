@@ -38,6 +38,10 @@ const DEBUG = (process.env.DEBUG || '').toLowerCase() === 'true';
 
 const PROXY_API_BASE = 'http://127.0.0.1:15721/v1';
 
+// 单轮对话里最多允许模型发起多少次联网搜索。流式与非流式两条路径共用同一个
+// 预算，避免两边行为不一致。
+const MAX_HOSTED_WEB_SEARCH_ROUNDS = 6;
+
 // 顶层由代理负责写入/清理的键（不属于任何 [section]）。
 // 清理时只对这些键动手，绝不改动用户自己定义的其它 provider 段。
 const PROXY_TOP_KEYS = /^(api_base_url|model_provider|model|model_catalog_json|model_reasoning_effort|model_reasoning_summary|model_supports_reasoning_summaries|show_raw_agent_reasoning|hide_agent_reasoning)\s*=/;
@@ -1165,10 +1169,16 @@ function buildResponseObjectFromState(state) {
     const combinedReasoning = state.reasoningParts.filter(Boolean).join('\n\n').trim();
 
     if (combinedReasoning) {
+        // 双通道 hedge：Codex 官方内核的事件名表（codex-api/src/sse/responses.rs）
+        // 只认识 response.reasoning_summary_text.* 与 response.reasoning_summary_part.*，
+        // 整份二进制里根本不存在 response.reasoning_text；UI 侧读的也是推理条目的
+        // summary 数组，所以只有 summary 会被真正渲染出来。因此同一个 reasoning 条目
+        // 同时带 summary（给 Codex 桌面端看）和 content（给会读原始思维链的客户端看），
+        // 换客户端也不用再改格式。
         output.push({
             type: 'reasoning',
             id: responseId + '_think',
-            summary: [],
+            summary: [{ type: 'summary_text', text: combinedReasoning }],
             content: [{ type: 'reasoning_text', text: combinedReasoning }]
         });
     }
@@ -1333,157 +1343,55 @@ async function resolveHostedResponseStreaming(res, chatBody) {
     tempState.searchEvents = firstRoundResult.searchEvents;
     const updatedBody = firstRoundResult.updatedChatBody;
 
-    const savedRP = tempState.reasoningParts.length;
-    const savedSE = tempState.searchEvents.length;
-    const savedAT = tempState.answerText;
-
-    let fallbackResult;
+    // 搜索之后的收尾轮继续走流式，而不是像以前那样发一个非流式请求、等整段答案
+    // 生成完再一次性补发事件。旧写法在那段等待里只会发 `: heartbeat` 注释行，而
+    // Codex 的 SSE 空闲计时器不认注释 —— 实测它会在第 300 秒判定流已断开并重试
+    // 整个回合（日志里是 `idle timeout waiting for SSE`）。改成流式后，推理、正文
+    // 和工具调用都随 token 实时流出，静默期只剩下游首字延迟。
     try {
-        fallbackResult = await resolveHostedResponseCore(updatedBody, tempState, 1);
-    } finally {
-        clearInterval(heartbeat);
-    }
+        let roundBody = updatedBody;
+        let roundResult = null;
+        for (let round = 1; round < MAX_HOSTED_WEB_SEARCH_ROUNDS; round++) {
+            roundResult = await streamSingleRound(res, roundBody, tempState, round);
 
-    log('STREAM_MAIN: fallback done, answerText=' + (tempState.answerText ? tempState.answerText.length + ' chars' : 'empty') + ', reasoningParts=' + tempState.reasoningParts.length + ', functionCalls=' + (tempState.functionCalls ? tempState.functionCalls.length : 0));
-
-    const newReasoningParts = tempState.reasoningParts.slice(savedRP);
-    const combinedNewReasoning = newReasoningParts.filter(Boolean).join('\n\n').trim();
-
-    if (combinedNewReasoning) {
-        const itemId = tempState.responseId + '_think_postsearch';
-        const reasonIdx = tempState.searchEvents.length + 2;
-        // Native `reasoning` item, same shape the round-0 stream emits.
-        await writeSseLine(res, JSON.stringify({
-            type: 'response.output_item.added',
-            item: { id: itemId, type: 'reasoning', summary: [], content: [] },
-            output_index: reasonIdx,
-            sequence_number: tempState.seq++
-        }));
-        const chunks = splitTextIntoChunks(combinedNewReasoning, 40);
-        for (const chunk of chunks) {
-            await writeSseLine(res, JSON.stringify({
-                type: 'response.reasoning_text.delta',
-                delta: chunk,
-                item_id: itemId,
-                output_index: reasonIdx,
-                content_index: 0,
-                sequence_number: tempState.seq++
-            }));
-            await new Promise(r => setTimeout(r, 15));
-        }
-        await writeSseLine(res, JSON.stringify({
-            type: 'response.reasoning_text.done',
-            text: combinedNewReasoning,
-            item_id: itemId,
-            output_index: reasonIdx,
-            content_index: 0,
-            sequence_number: tempState.seq++
-        }));
-        await writeSseLine(res, JSON.stringify({
-            type: 'response.output_item.done',
-            item: { id: itemId, type: 'reasoning', summary: [], content: [{ type: 'reasoning_text', text: combinedNewReasoning }] },
-            output_index: reasonIdx,
-            sequence_number: tempState.seq++
-        }));
-    }
-
-    // Slots are handed out two at a time (see the +2 offsets below). Track the
-    // next free slot outside the guard so the post-search tool calls further
-    // down stay correctly indexed even when there is no answer text.
-    let nextFreeIdx = combinedNewReasoning ? (tempState.searchEvents.length + 4) : (tempState.searchEvents.length + 2);
-
-    if (tempState.answerText) {
-        const itemId = tempState.responseId + '_msg_postsearch';
-        const outIdx = nextFreeIdx;
-        await writeSseLine(res, JSON.stringify({
-            type: 'response.output_item.added',
-            item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
-            output_index: outIdx,
-            sequence_number: tempState.seq++
-        }));
-        await writeSseLine(res, JSON.stringify({
-            type: 'response.content_part.added',
-            part: { id: itemId + '_part0', type: 'output_text', text: '' },
-            item_id: itemId,
-            output_index: outIdx,
-            content_index: 0,
-            sequence_number: tempState.seq++
-        }));
-        const chunks = splitTextIntoChunks(tempState.answerText, 40);
-        for (const chunk of chunks) {
-            await writeSseLine(res, JSON.stringify({
-                type: 'response.output_text.delta',
-                delta: chunk,
-                item_id: itemId,
-                output_index: outIdx,
-                content_index: 0,
-                sequence_number: tempState.seq++
-            }));
-            await new Promise(r => setTimeout(r, 15));
-        }
-        await writeSseLine(res, JSON.stringify({
-            type: 'response.output_text.done',
-            text: tempState.answerText,
-            item_id: itemId,
-            output_index: outIdx,
-            content_index: 0,
-            sequence_number: tempState.seq++
-        }));
-        await writeSseLine(res, JSON.stringify({
-            type: 'response.content_part.done',
-            part: { id: itemId + '_part0', type: 'output_text', text: tempState.answerText },
-            item_id: itemId,
-            output_index: outIdx,
-            content_index: 0,
-            sequence_number: tempState.seq++
-        }));
-        await writeSseLine(res, JSON.stringify({
-            type: 'response.output_item.done',
-            item: { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: tempState.answerText }] },
-            output_index: outIdx,
-            sequence_number: tempState.seq++
-        }));
-        nextFreeIdx += 2;
-    }
-
-    const externalFcAfterSearch = tempState.functionCalls && tempState.functionCalls.filter(tc => tc.name !== 'web_search');
-    if (externalFcAfterSearch && externalFcAfterSearch.length > 0) {
-        const fcBaseIdx = nextFreeIdx;
-        for (let i = 0; i < externalFcAfterSearch.length; i++) {
-            const tc = externalFcAfterSearch[i];
-            const fcIdx = fcBaseIdx + i;
-            const itemId = tempState.responseId + '_fc_post_' + (tc.index || i);
-            await writeSseLine(res, JSON.stringify({
-                type: 'response.output_item.added',
-                item: toResponseCallItem(itemId, tc.name, tc.id, tc.arguments, 'in_progress'),
-                output_index: fcIdx,
-                sequence_number: tempState.seq++
-            }));
-            if (!FREEFORM_TOOLS.has(tc.name)) {
-                await writeSseLine(res, JSON.stringify({
-                    type: 'response.function_call_arguments.done',
-                    arguments: tc.arguments,
-                    item_id: itemId,
-                    output_index: fcIdx,
-                    sequence_number: tempState.seq++
-                }));
+            if (!roundResult) {
+                // 这一轮把外部工具调用交还给了 Codex，回合已在 streamSingleRound 里收尾。
+                log('STREAM_MAIN: round ' + round + ' handed external tool calls back to Codex');
+                return;
             }
-            await writeSseLine(res, JSON.stringify({
-                type: 'response.output_item.done',
-                item: toResponseCallItem(itemId, tc.name, tc.id, tc.arguments, 'completed'),
-                output_index: fcIdx,
-                sequence_number: tempState.seq++
-            }));
-        }
-    }
 
-    await writeSseLine(res, JSON.stringify({
-        type: 'response.completed',
-        response: { id: tempState.responseId, status: 'completed', output: [], usage: usageFromTotals(tempState.usageTotals) },
-        sequence_number: tempState.seq++
-    }));
-    await writeSseRaw(res, 'data: [DONE]\n\n');
-    await finishSseIfOpen(res);
+            if (tempState.clientGone) {
+                log('STREAM_MAIN: client disconnected during round ' + round);
+                return;
+            }
+
+            tempState.searchEvents = tempState.searchEvents.concat(roundResult.searchEvents);
+
+            if (roundResult.webSearchCalls.length === 0) {
+                // 最终答案（或空回合提示）已经流出，completed 也发过了。
+                log('STREAM_MAIN: round ' + round + ' produced the final answer');
+                return;
+            }
+
+            roundBody = roundResult.updatedChatBody;
+        }
+
+        // 每一轮都还在要搜索，说明预算用完了。这时不再直接失败，而是去掉搜索工具再
+        // 追问最后一次，逼模型用手上已有的信息作答。
+        log('HOSTED SEARCH:', 'round budget exhausted, forcing a final answer');
+        const finalBody = JSON.parse(JSON.stringify(roundBody));
+        delete finalBody.tools;
+        delete finalBody.tool_choice;
+        finalBody.messages.push({
+            role: 'system',
+            content: 'Web search budget exhausted. Answer the user now with the information already gathered.'
+        });
+        await streamSingleRound(res, finalBody, tempState, MAX_HOSTED_WEB_SEARCH_ROUNDS);
+    } finally {
+        // finally 同时覆盖正常返回与中途抛错，避免心跳定时器泄漏。
+        clearInterval(heartbeat);
+        await finishSseIfOpen(res);
+    }
 }
 
 function finishSseIfOpen(res) {
@@ -1681,7 +1589,6 @@ async function emitAssistantTextAndComplete(res, responseId, text, skipHeader) {
 }
 
 async function resolveHostedResponseCore(chatBody, sharedState, startRound) {
-    const MAX_HOSTED_WEB_SEARCH_ROUNDS = 6;
     const workingChatBody = JSON.parse(JSON.stringify(chatBody));
     workingChatBody.stream = false;
     // The hosted-search follow-up rounds are non-streaming, so drop the
@@ -1880,7 +1787,11 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
     let contentItemAdded = false;
     let reasonItemAdded = false;
     let contentIndex = 0;
-    let reasonIndex = 0;
+    // output_index 用全局递增槽位计数器分配：静态"每轮 2 槽"公式在轮内出现
+    // 搜索/工具条目时会溢出到下一轮的槽位造成撞 index，这里每发一个条目取一个新槽。
+    // tempState 跨轮共享，前一轮用掉的槽位自动累计。
+    let nextSlot = state.nextSlot || 0;
+    let reasonIndex = nextSlot;
     let functionCallItemsAdded = new Set();
 
     const messages = chatBody.messages;
@@ -1928,27 +1839,45 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
         if (reasoning) {
             fullReasoning += reasoning;
             if (!reasonItemAdded) {
-                reasonIndex = roundIndex;
+                reasonIndex = nextSlot++;
                 reasonItemAdded = true;
                 const itemId = state.responseId + '_think_r' + roundIndex;
-                // Emit a native `reasoning` item so Codex renders the chain of
-                // thought in its own thinking style instead of as assistant text.
-                // The text is sent as raw `reasoning_text` (not a summary): NIM
-                // streams the model's real chain of thought and
-                // `show_raw_agent_reasoning` is on, so this matches the shape the
-                // official DeepSeek/third-party Responses integrations use.
+                // 发一个原生 `reasoning` 条目，让 Codex 用自己的"思考"样式渲染思维链，
+                // 而不是当成普通回答正文。
+                //
+                // 双通道 hedge：Codex 内核的事件名表只认
+                // response.reasoning_summary_text.* / response.reasoning_summary_part.*，
+                // 根本没有 response.reasoning_text（会被记成 "unhandled responses
+                // event"），所以真正能显示出来的是 summary 通道；而 content 通道留给
+                // 会读原始思维链的客户端。条目本身两边都带上，谁都能解析。
                 await writeSseLine(res, JSON.stringify({
                     type: 'response.output_item.added',
                     item: { id: itemId, type: 'reasoning', summary: [], content: [] },
-                    output_index: reasonIndex * 2,
+                    output_index: reasonIndex,
+                    sequence_number: state.seq++
+                }));
+                await writeSseLine(res, JSON.stringify({
+                    type: 'response.reasoning_summary_part.added',
+                    part: { type: 'summary_text', text: '' },
+                    item_id: itemId,
+                    output_index: reasonIndex,
+                    summary_index: 0,
                     sequence_number: state.seq++
                 }));
             }
             await writeSseLine(res, JSON.stringify({
+                type: 'response.reasoning_summary_text.delta',
+                delta: reasoning,
+                item_id: state.responseId + '_think_r' + roundIndex,
+                output_index: reasonIndex,
+                summary_index: 0,
+                sequence_number: state.seq++
+            }));
+            await writeSseLine(res, JSON.stringify({
                 type: 'response.reasoning_text.delta',
                 delta: reasoning,
                 item_id: state.responseId + '_think_r' + roundIndex,
-                output_index: reasonIndex * 2,
+                output_index: reasonIndex,
                 content_index: 0,
                 sequence_number: state.seq++
             }));
@@ -1959,7 +1888,7 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
             // A reply whose only content was model-internal markup leaves just
             // whitespace behind — don't open a bubble for it.
             if (!contentItemAdded && fullContent.trim()) {
-                contentIndex = roundIndex * 2 + 1;
+                contentIndex = nextSlot++;
                 contentItemAdded = true;
                 const itemId = state.responseId + '_msg_r' + roundIndex;
                 await writeSseLine(res, JSON.stringify({
@@ -1994,17 +1923,38 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
         log('STREAM_R' + roundIndex + ': reasonItemAdded, fullReasoning=' + fullReasoning.length + ' chars');
         const itemId = state.responseId + '_think_r' + roundIndex;
         await writeSseLine(res, JSON.stringify({
+            type: 'response.reasoning_summary_text.done',
+            text: fullReasoning,
+            item_id: itemId,
+            output_index: reasonIndex,
+            summary_index: 0,
+            sequence_number: state.seq++
+        }));
+        await writeSseLine(res, JSON.stringify({
+            type: 'response.reasoning_summary_part.done',
+            part: { type: 'summary_text', text: fullReasoning },
+            item_id: itemId,
+            output_index: reasonIndex,
+            summary_index: 0,
+            sequence_number: state.seq++
+        }));
+        await writeSseLine(res, JSON.stringify({
             type: 'response.reasoning_text.done',
             text: fullReasoning,
             item_id: itemId,
-            output_index: reasonIndex * 2,
+            output_index: reasonIndex,
             content_index: 0,
             sequence_number: state.seq++
         }));
         await writeSseLine(res, JSON.stringify({
             type: 'response.output_item.done',
-            item: { id: itemId, type: 'reasoning', summary: [], content: [{ type: 'reasoning_text', text: fullReasoning }] },
-            output_index: reasonIndex * 2,
+            item: {
+                id: itemId,
+                type: 'reasoning',
+                summary: [{ type: 'summary_text', text: fullReasoning }],
+                content: [{ type: 'reasoning_text', text: fullReasoning }]
+            },
+            output_index: reasonIndex,
             sequence_number: state.seq++
         }));
         if (!state.streamedReasoningIndexes) state.streamedReasoningIndexes = new Set();
@@ -2047,7 +1997,8 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
 
     if (externalToolCalls.length > 0) {
         for (const tc of externalToolCalls) {
-            const fcIndex = contentIndex + 1;
+            // 每个工具调用取自己的新槽位，避免多个工具共用同一个 output_index。
+            const fcIndex = nextSlot++;
             const itemId = state.responseId + '_fc_r' + roundIndex + '_' + tc.index;
             await writeSseLine(res, JSON.stringify({
                 type: 'response.output_item.added',
@@ -2077,6 +2028,7 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
             sequence_number: state.seq++
         }));
         await writeSseRaw(res, 'data: [DONE]\n\n');
+        state.nextSlot = nextSlot;
         return null;
     }
 
@@ -2093,7 +2045,6 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
             }))
         });
 
-        const nextIndex = contentItemAdded ? contentIndex : reasonIndex * 2 + 1;
         for (const tc of webSearchCalls) {
             const fn = tc.function || {};
             let args = {};
@@ -2101,10 +2052,11 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
             const query = args.searchTerm || args.query || args.q || '';
 
             const wsItemId = tc.id || (state.responseId + '_ws_' + searchEvents.length);
+            const wsIndex = nextSlot++;
             await writeSseLine(res, JSON.stringify({
                 type: 'response.output_item.added',
                 item: { id: wsItemId, type: 'web_search_call', status: 'in_progress', action: { type: 'search', queries: [query] } },
-                output_index: nextIndex + searchEvents.length,
+                output_index: wsIndex,
                 sequence_number: state.seq++
             }));
 
@@ -2115,7 +2067,7 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
                 await writeSseLine(res, JSON.stringify({
                     type: 'response.output_item.done',
                     item: { id: wsItemId, type: 'web_search_call', status: 'completed', action: { type: 'search', queries: [] }, results: [] },
-                    output_index: nextIndex + searchEvents.length - 1,
+                    output_index: wsIndex,
                     sequence_number: state.seq++
                 }));
                 continue;
@@ -2131,7 +2083,7 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
             await writeSseLine(res, JSON.stringify({
                 type: 'response.output_item.done',
                 item: { id: wsItemId, type: 'web_search_call', status: 'completed', action: { type: 'search', queries: [query] }, results: se.results },
-                output_index: nextIndex + searchEvents.length - 1,
+                output_index: wsIndex,
                 sequence_number: state.seq++
             }));
         }
@@ -2150,7 +2102,7 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
                 res,
                 state.responseId + '_empty_r' + roundIndex,
                 emptyReplyText(state.model),
-                roundIndex * 2 + 1,
+                nextSlot++,
                 state
             );
         }
@@ -2162,6 +2114,7 @@ async function streamSingleRound(res, chatBody, state, roundIndex) {
         await writeSseRaw(res, 'data: [DONE]\n\n');
     }
 
+    state.nextSlot = nextSlot;
     return streamResult;
 }
 
