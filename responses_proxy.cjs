@@ -1289,7 +1289,7 @@ async function resolveHostedResponse(chatBody) {
     return await resolveHostedResponseCore(chatBody, null, 0);
 }
 
-async function resolveHostedResponseStreaming(res, chatBody) {
+async function resolveHostedResponseStreaming(res, chatBody, endpoint) {
     const tempState = {
         responseId: 'resp_' + Date.now(),
         reasoningParts: [],
@@ -1303,6 +1303,47 @@ async function resolveHostedResponseStreaming(res, chatBody) {
         model: chatBody.model
     };
 
+    const workingChatBody = JSON.parse(JSON.stringify(chatBody));
+    workingChatBody.stream = true;
+    // Ask NIM to attach token usage to the final stream chunk, so the proxy can
+    // report real counts in `response.completed` instead of leaving them at zero.
+    workingChatBody.stream_options = { include_usage: true };
+    workingChatBody.messages = Array.isArray(workingChatBody.messages) ? workingChatBody.messages : [];
+
+    // 「分层报错」第 2 层：开流之前先探一次上游。
+    // 只要失败发生在流开始前（上游 401/402/403/404/429/5xx，或压根连不上），
+    // 我们还能返回一个**真实的 HTTP 状态码 + JSON**，让 Codex 渲染它自己的原生
+    // 错误卡片——没有 "Reconnecting N/5"，也没有 "stream disconnected before
+    // completion:" 前缀。一旦 writeHead(200) 写出去，就只剩 SSE 一条路了。
+    let firstResponse;
+    try {
+        const opened = await forwardRequestWithRetry(null, JSON.stringify(workingChatBody));
+        firstResponse = opened.response;
+    } catch (e) {
+        // 重试耗尽仍连不上上游：这是"流开始前"的失败，回 502。
+        log('STREAM_MAIN: upstream unreachable before stream start:', e.message);
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(codexErrorEnvelope(502, e, chatBody.model, endpoint)));
+        return;
+    }
+
+    const firstStatus = firstResponse.statusCode || 200;
+    if (firstStatus !== 200) {
+        let raw = '';
+        try { raw = await readIncomingMessage(firstResponse); } catch (e) {}
+        log('STREAM_MAIN: upstream HTTP ' + firstStatus + ' before stream start, body:', (raw || '').substring(0, 300));
+        if (firstStatus === 404) blacklistModel(chatBody.model);
+        res.writeHead(firstStatus, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(codexErrorEnvelope(firstStatus, { message: raw, body: raw }, chatBody.model, endpoint)));
+        return;
+    }
+
+    // 上游已就绪（200）——此刻才真正开流。
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+    });
     if (res.socket) { res.socket.setNoDelay(true); }
 
     await writeSseLine(res, JSON.stringify({
@@ -1337,16 +1378,10 @@ async function resolveHostedResponseStreaming(res, chatBody) {
     };
     res.on('close', onClientClose);
 
-    const workingChatBody = JSON.parse(JSON.stringify(chatBody));
-    workingChatBody.stream = true;
-    // Ask NIM to attach token usage to the final stream chunk, so the proxy can
-    // report real counts in `response.completed` instead of leaving them at zero.
-    workingChatBody.stream_options = { include_usage: true };
-    workingChatBody.messages = Array.isArray(workingChatBody.messages) ? workingChatBody.messages : [];
-
     let firstRoundResult;
     try {
-        firstRoundResult = await streamSingleRound(res, workingChatBody, tempState, 0);
+        // 复用上面已经建好并校验过状态码的第 0 轮上游连接（preOpenedResponse）。
+        firstRoundResult = await streamSingleRound(res, workingChatBody, tempState, 0, firstResponse);
     } catch (e) {
         clearInterval(heartbeat);
         throw e;
@@ -1433,9 +1468,11 @@ function finishSseIfOpen(res) {
     }
 }
 
-// Codex does not render `type: 'error'` SSE events, so proxy-side failures are
-// delivered as ordinary assistant messages. Quoting them with a bold header
-// keeps them visually distinct from real model replies.
+// Codex does not render `type: 'error'` SSE events, so proxy-side notices (empty
+// turn, web-search budget exhausted) are delivered as ordinary assistant
+// messages. Quoting them with a bold header keeps them visually distinct from
+// real model replies. Hard failures no longer use this path — they go out as
+// HTTP errors / response.failed so Codex renders its own native error card.
 function errorReply(title, detail) {
     return '> **' + title + '**\n>\n> ' + detail;
 }
@@ -1480,6 +1517,29 @@ function upstreamErrorDetail(statusCode, err, model) {
         + '; cause: ' + cause + '. ' + advice;
 }
 
+// HTTP 错误响应的 body。字段刻意对齐 CC Switch 本地代理的信封：
+//   {"error": {message, type, code, param, provider, model, endpoint, upstream_status}}
+// 而不是最小化的 {"error": {code, message}}。原因是 Codex 对两者的处理不同——
+// 最小信封会让它套上 "unexpected status <code> <reason>: <body>, url: <url>"
+// 的外壳，并把这一轮当"意外状态码"重采样 5 次（UI 上就是 "Reconnecting 5/5"）；
+// 带 type/param/provider/... 的完整信封则只显示 error.message，不加壳也不重试。
+// 这层信封是 Codex 客户端的展示行为，代理这边唯一能控制的就是把它喂成它认得的形状。
+function codexErrorEnvelope(statusCode, err, model, endpoint) {
+    const envelope = {
+        message: upstreamErrorDetail(statusCode, err, model),
+        type: 'proxy_error',
+        code: 'nim_proxy_error',
+        param: null,
+        provider: 'NVIDIA NIM',
+        model: model || 'unknown',
+        endpoint: endpoint || '/responses'
+    };
+    if (statusCode) {
+        envelope.upstream_status = statusCode;
+    }
+    return { error: envelope };
+}
+
 // Terminate a streaming turn with the Responses protocol's failure event so
 // the client renders its own native error UI. Codex maps response.failed to
 // an error card showing error.message; it does not render type:'error' SSE
@@ -1503,39 +1563,6 @@ async function emitResponseFailed(res, responseId, seqRef, message) {
     // 所以只有失败轮会中招——Codex 日志里该解析错误只出现在失败轮。）
     // 同时必须立刻 end：否则连接悬挂，客户端一直等不到流结束。
     try { res.end(); } catch (e) {}
-}
-
-// Turn a failed upstream request into an alert reply. 404 means the model is
-// gone from this account, 402 an exhausted quota, 401/403 a rejected key, 429
-// throttling; a 500 without a response body is a bug in the proxy itself.
-function upstreamErrorReply(statusCode, err, model) {
-    const raw = (err && err.message) || 'unknown error';
-    if (statusCode === 404) {
-        return errorReply('NIM proxy: model not available (404)',
-            'NVIDIA NIM does not serve "' + (model || '') + '". It was removed from your model list — switch to another model.');
-    }
-    if (statusCode === 402) {
-        return errorReply('NIM proxy: NVIDIA quota exhausted (402)',
-            'The free trial quota for this NVIDIA account is used up, so the request was rejected. Switching models will not help — use a different API key (or a paid endpoint) and retry.');
-    }
-    if (statusCode === 401 || statusCode === 403) {
-        return errorReply('NIM proxy: API key rejected (' + statusCode + ')',
-            'NVIDIA refused the API key. Check NVIDIA_API_KEY in .env, restart the proxy, then retry.');
-    }
-    if (statusCode === 429) {
-        return errorReply('NIM proxy: rate limited (429)',
-            'NVIDIA is throttling this key — the free tier allows only a few requests per minute per model. Wait a moment and retry, or switch to another model.');
-    }
-    if (statusCode === 500 && !(err && err.body)) {
-        return errorReply('NIM proxy: internal error (500)',
-            raw + '\n>\n> This is a bug in the proxy itself, not a model reply. Restart the proxy and retry; if it keeps happening, please report the message above.');
-    }
-    if (statusCode >= 500) {
-        return errorReply('NIM proxy: NVIDIA server error (' + statusCode + ')',
-            'NVIDIA returned an internal error. Try again in a moment, or switch models.');
-    }
-    return errorReply('NIM proxy: NVIDIA error (' + statusCode + ')',
-        'The model may be overloaded. Try again or switch models.');
 }
 
 // A turn that yields no text, no tool call and no thinking is nothing the user
@@ -1594,78 +1621,6 @@ async function writeAssistantMessageEvents(res, itemId, text, outputIndex, state
         output_index: outputIndex,
         sequence_number: state.seq++
     }));
-}
-
-// Emit a standard Responses streaming event sequence that renders `text` as a
-// single assistant message, then completes the stream. With `skipHeader`, the
-// caller has already written `response.created` / `response.in_progress` (e.g.
-// mid-stream errors), so we only append the message + completion events.
-async function emitAssistantTextAndComplete(res, responseId, text, skipHeader) {
-    let seq = 0;
-    if (!skipHeader) {
-        await writeSseLine(res, JSON.stringify({
-            type: 'response.created',
-            response: { id: responseId, status: 'in_progress', output: [] },
-            sequence_number: seq++
-        }));
-        await writeSseLine(res, JSON.stringify({
-            type: 'response.in_progress',
-            response: { id: responseId, status: 'in_progress', output: [] },
-            sequence_number: seq++
-        }));
-    }
-    const itemId = responseId + '_msg';
-    await writeSseLine(res, JSON.stringify({
-        type: 'response.output_item.added',
-        item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
-        output_index: 0,
-        sequence_number: seq++
-    }));
-    await writeSseLine(res, JSON.stringify({
-        type: 'response.content_part.added',
-        part: { id: itemId + '_part0', type: 'output_text', text: '' },
-        item_id: itemId,
-        output_index: 0,
-        content_index: 0,
-        sequence_number: seq++
-    }));
-    await writeSseLine(res, JSON.stringify({
-        type: 'response.output_text.delta',
-        delta: text,
-        item_id: itemId,
-        output_index: 0,
-        content_index: 0,
-        sequence_number: seq++
-    }));
-    await writeSseLine(res, JSON.stringify({
-        type: 'response.output_text.done',
-        text,
-        item_id: itemId,
-        output_index: 0,
-        content_index: 0,
-        sequence_number: seq++
-    }));
-    await writeSseLine(res, JSON.stringify({
-        type: 'response.content_part.done',
-        part: { id: itemId + '_part0', type: 'output_text', text },
-        item_id: itemId,
-        output_index: 0,
-        content_index: 0,
-        sequence_number: seq++
-    }));
-    await writeSseLine(res, JSON.stringify({
-        type: 'response.output_item.done',
-        item: { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] },
-        output_index: 0,
-        sequence_number: seq++
-    }));
-    await writeSseLine(res, JSON.stringify({
-        type: 'response.completed',
-        response: { id: responseId, status: 'completed', output: [] },
-        sequence_number: seq++
-    }));
-    await writeSseRaw(res, 'data: [DONE]\n\n');
-    try { res.end(); } catch (e) {}
 }
 
 async function resolveHostedResponseCore(chatBody, sharedState, startRound) {
@@ -1838,36 +1793,44 @@ async function processResponseIncremental(response, onDelta) {
     });
 }
 
-async function streamSingleRound(res, chatBody, state, roundIndex) {
-    const bodyStr = JSON.stringify(chatBody);
-    let result;
-    try {
-        result = await forwardRequestWithRetry(null, bodyStr);
-    } catch (e) {
-        // 重试耗尽仍连不上上游：发 response.failed 让 Codex 渲染原生错误卡片，
-        // 而不是把网络故障伪装成一条模型回复。
-        log('STREAM_R' + roundIndex + ': upstream unreachable after retries:', e.message);
-        state.streamFailed = true;
-        await emitResponseFailed(res, state.responseId, state, upstreamErrorDetail(0, e, chatBody.model));
-        return null;
+async function streamSingleRound(res, chatBody, state, roundIndex, preOpenedResponse) {
+    let response;
+    if (preOpenedResponse) {
+        // 第 0 轮的上游连接已在开流前建好、并且确认过 200（见
+        // resolveHostedResponseStreaming），这里直接复用，不再重复请求——
+        // 也就不用再序列化一次请求体（开流前那次 stringify 已经发过了）。
+        response = preOpenedResponse;
+    } else {
+        const bodyStr = JSON.stringify(chatBody);
+        let result;
+        try {
+            result = await forwardRequestWithRetry(null, bodyStr);
+        } catch (e) {
+            // 重试耗尽仍连不上上游：发 response.failed 让 Codex 渲染原生错误卡片，
+            // 而不是把网络故障伪装成一条模型回复。
+            log('STREAM_R' + roundIndex + ': upstream unreachable after retries:', e.message);
+            state.streamFailed = true;
+            await emitResponseFailed(res, state.responseId, state, upstreamErrorDetail(0, e, chatBody.model));
+            return null;
+        }
+        response = result.response;
+        const statusCode = response.statusCode || 200;
+
+        if (statusCode !== 200) {
+            const raw = await readIncomingMessage(response);
+            log('STREAM_R' + roundIndex + ': upstream HTTP ' + statusCode + ', body:', (raw || '').substring(0, 300));
+            if (statusCode === 404) blacklistModel(chatBody.model);
+            state.streamFailed = true;
+            await emitResponseFailed(res, state.responseId, state, upstreamErrorDetail(statusCode, { message: raw, body: raw }, chatBody.model));
+            return null;
+        }
     }
-    const response = result.response;
-    const statusCode = response.statusCode || 200;
 
     // Hand the upstream stream to the shared client-close handler (registered in
     // resolveHostedResponseStreaming) so a disconnect can abort it immediately.
     state.upstream = response;
     if (state.clientGone) {
         try { response.destroy(); } catch (e) {}
-    }
-
-    if (statusCode !== 200) {
-        const raw = await readIncomingMessage(response);
-        log('STREAM_R' + roundIndex + ': upstream HTTP ' + statusCode + ', body:', (raw || '').substring(0, 300));
-        if (statusCode === 404) blacklistModel(chatBody.model);
-        state.streamFailed = true;
-        await emitResponseFailed(res, state.responseId, state, upstreamErrorDetail(statusCode, { message: raw, body: raw }, chatBody.model));
-        return null;
     }
 
     let fullContent = '';
@@ -2641,32 +2604,14 @@ const proxyServer = http.createServer(async (req, res) => {
                 // returned 404 for it before. Fail natively instead of round-tripping
                 // to NIM and waiting for another 404.
                 if (isBlacklisted(chatBody.model)) {
-                    const failId = 'resp_blacklisted_' + Date.now();
-                    const failMsg = upstreamErrorDetail(404, { message: 'model is on the proxy blacklist (NIM does not serve it)' }, chatBody.model);
                     log('Pre-flight blacklist rejection:', chatBody.model);
-                    if (isStream) {
-                        res.writeHead(200, {
-                            'Content-Type': 'text/event-stream',
-                            'Cache-Control': 'no-cache',
-                            'Connection': 'keep-alive'
-                        });
-                        if (res.socket) res.socket.setNoDelay(true);
-                        const seqRef = { seq: 0 };
-                        await writeSseLine(res, JSON.stringify({
-                            type: 'response.created',
-                            response: { id: failId, status: 'in_progress', output: [] },
-                            sequence_number: seqRef.seq++
-                        }));
-                        await writeSseLine(res, JSON.stringify({
-                            type: 'response.in_progress',
-                            response: { id: failId, status: 'in_progress', output: [] },
-                            sequence_number: seqRef.seq++
-                        }));
-                        await emitResponseFailed(res, failId, seqRef, failMsg);
-                    } else {
-                        res.writeHead(404, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ error: { code: 'nim_proxy_error', message: failMsg } }));
-                    }
+                    // 失败在流开始前就已成定局，所以不走 SSE，直接返回真实 HTTP 状态码 + JSON。
+                    // 这样 Codex 渲染的是它自己的错误卡片：没有 "Reconnecting 5/5"，也没有
+                    // "stream disconnected before completion:" 前缀——因为 Codex 并不把
+                    // response.failed 视为回合结束事件，会把它当成"未完成断流"而重试 5 次。
+                    // 流式与非流式在此统一处理（此前流式分支还额外多发了一对 created/in_progress）。
+                    res.writeHead(404, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify(codexErrorEnvelope(404, { message: 'model is on the proxy blacklist (NIM does not serve it)' }, chatBody.model, req.url)));
                     return;
                 }
 
@@ -2680,7 +2625,7 @@ const proxyServer = http.createServer(async (req, res) => {
                         // 上游失败直通 HTTP 状态码 + 结构化错误体，而不是 200 + 伪装成
                         // 正常回复——非流式客户端（含 Codex compact 等）能看到真实失败。
                         res.writeHead(statusCode, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ error: { code: 'nim_proxy_error', message: upstreamErrorDetail(statusCode, e, chatBody.model) } }));
+                        res.end(JSON.stringify(codexErrorEnvelope(statusCode, e, chatBody.model, req.url)));
                         return;
                     }
                     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -2688,27 +2633,24 @@ const proxyServer = http.createServer(async (req, res) => {
                     return;
                 }
 
-                res.writeHead(200, {
-                    'Content-Type': 'text/event-stream',
-                    'Cache-Control': 'no-cache',
-                    'Connection': 'keep-alive'
-                });
-                if (res.socket) {
-                    res.socket.setNoDelay(true);
-                }
-
+                // 注意：这里不再 writeHead(200)。开流（writeHead 200 + response.created）
+                // 已移入 resolveHostedResponseStreaming —— 它要先看第 0 轮上游的真实
+                // 状态码，才能决定是「开 SSE」还是「回 HTTP 错误」（分层报错）。
                 try {
-                    await resolveHostedResponseStreaming(res, chatBody);
+                    await resolveHostedResponseStreaming(res, chatBody, req.url);
                 } catch (streamErr) {
                     log('Stream error:', streamErr.message);
                     if (streamErr.body) log('Stream error body:', streamErr.body.substring(0, 500));
                     const statusCode = streamErr.statusCode || 500;
-                    if (!res.writableEnded && !res.destroyed) {
-                        // response.created / response.in_progress were already
-                        // written before the stream errored, so append only the
-                        // message + completion events (skipHeader = true). The
-                        // `type: 'error'` event is not rendered by Codex.
-                        await emitAssistantTextAndComplete(res, 'resp_error_' + Date.now(), upstreamErrorReply(statusCode, streamErr, chatBody.model), true);
+                    if (res.headersSent) {
+                        // 流已经开始：只能用 response.failed（Codex 原生错误卡片）。
+                        if (!res.writableEnded && !res.destroyed) {
+                            await emitResponseFailed(res, 'resp_error_' + Date.now(), { seq: 0 }, upstreamErrorDetail(statusCode, streamErr, chatBody.model));
+                        }
+                    } else {
+                        // 流还没开始：还能给真实 HTTP 状态码。
+                        res.writeHead(500, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify(codexErrorEnvelope(statusCode, streamErr, chatBody.model, req.url)));
                     }
                     // Blacklist models that return 404 (not available for this account)
                     if (statusCode === 404) {
@@ -2723,7 +2665,7 @@ const proxyServer = http.createServer(async (req, res) => {
                 }
                 if (!res.headersSent) {
                     res.writeHead(500, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ error: e.message }));
+                    res.end(JSON.stringify(codexErrorEnvelope(500, e, chatBody && chatBody.model, req.url)));
                 }
             }
         });
