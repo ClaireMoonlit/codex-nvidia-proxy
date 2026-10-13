@@ -1494,7 +1494,15 @@ async function emitResponseFailed(res, responseId, seqRef, message) {
         },
         sequence_number: seqRef.seq++
     }));
-    await writeSseRaw(res, 'data: [DONE]\n\n');
+    // 失败流到此为止，绝不能再补 Chat Completions 的 `data: [DONE]` 哨兵。
+    // Responses API 没有 [DONE]；Codex 的响应解析器会把这 6 个字节记成
+    // "Failed to parse SSE event error_category=Syntax error_line=1 error_column=2
+    // payload_bytes=6"，进而把整条失败流误判为传输层断流，UI 显示
+    // "Reconnecting 1/5" 重试，而不是渲染 response.failed 的原生错误卡片。
+    // （成功流也是读到 response.completed 即停、永远看不到尾部的 [DONE]，
+    // 所以只有失败轮会中招——Codex 日志里该解析错误只出现在失败轮。）
+    // 同时必须立刻 end：否则连接悬挂，客户端一直等不到流结束。
+    try { res.end(); } catch (e) {}
 }
 
 // Turn a failed upstream request into an alert reply. 404 means the model is
