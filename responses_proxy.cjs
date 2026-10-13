@@ -28,6 +28,23 @@ const path = require('path');
 
 const NVIDIA_HOST = 'integrate.api.nvidia.com';
 const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY;
+
+// 上游请求专用的 HTTPS agent，刻意禁用 keep-alive。
+//
+// 为什么不用默认的全局 agent：Node 19 起 `http.globalAgent.keepAlive` 默认为 true
+// （本机 Node v24 实测确认），响应结束后 socket 会被放回连接池供下次复用。而 NIM
+// 边缘节点在上一个响应结束时就关闭了这条连接，于是紧跟着的下一个请求会**毫秒级复用
+// 一条半开（half-open）的 socket**：本地写入不报错、对端永不回 ACK，TCP 重传耗尽
+// 大约 40 秒后才抛 `read ECONNRESET`。
+//
+// 日志实锤（一次 6 轮搜索回合）：只有"紧接上一轮"的 5~6 次首尝试全部在 40.0~40.9s
+// 被掐，重试换成新连接后即使 prefill 花 70s 也能成功——说明 40s 不是 NIM 的固定
+// 上限，而是那条被复用的死连接本身的问题；间隔 98s 后才发的 R0（连接已被 agent
+// 回收）则一次成功。白白拖慢每一轮约 40 秒。
+//
+// `keepAlive: false` 让每次请求都新建 TCP/TLS 连接，从根上消除复用；代价仅一次
+// 握手（百毫秒级），相对每轮 40~70s 的排队+prefill 可忽略。
+const NVIDIA_AGENT = new https.Agent({ keepAlive: false });
 const PROXY_PORT = 15721;
 const CONFIG_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '~', '.codex', 'config.toml');
 const MODEL_STATE_PATH = path.join(__dirname, 'model_state.json');
@@ -44,8 +61,27 @@ const MAX_HOSTED_WEB_SEARCH_ROUNDS = 6;
 
 // 顶层由代理负责写入/清理的键（不属于任何 [section]）。
 // 清理时只对这些键动手，绝不改动用户自己定义的其它 provider 段。
-const PROXY_TOP_KEYS = /^(api_base_url|model_provider|model|model_catalog_json|model_reasoning_effort|model_reasoning_summary|model_supports_reasoning_summaries|show_raw_agent_reasoning|hide_agent_reasoning)\s*=/;
+const PROXY_TOP_KEYS = /^(api_base_url|model_provider|model|model_catalog_json|model_context_window|model_auto_compact_token_limit|model_reasoning_effort|model_reasoning_summary|model_supports_reasoning_summaries|show_raw_agent_reasoning|hide_agent_reasoning)\s*=/;
 const PROXY_PROVIDER_SECTION = 'model_providers.nvidia-proxy';
+
+// 上下文窗口（token）——只收录经官网核实过的值，未列出的模型一律保守按 128K。
+// 宁可让 Codex 提前压缩，也不能让它以为窗口很大而一直不压缩（那正是之前会话
+// 撑到几百 MB 才被 413 拦下的根源）。
+const CONTEXT_WINDOWS = [
+    [/glm-5\.3/, 1048576],   // build.nvidia.com/z-ai/glm-5-3-flash: Context Length 1M
+    [/kimi-k2/, 262144]      // Kimi K2 官方 256K
+];
+const DEFAULT_CONTEXT_WINDOW = 131072;
+const AUTO_COMPACT_RATIO = 0.7; // 压缩阈值取窗口的 70%，给压缩摘要留出生成空间
+
+function contextWindowFor(modelId) {
+    const hit = CONTEXT_WINDOWS.find(([re]) => re.test(modelId));
+    return hit ? hit[1] : DEFAULT_CONTEXT_WINDOW;
+}
+
+function isThinkingModel(modelId) {
+    return /thinking|deepseek-v4-pro|kimi-k2/.test(modelId);
+}
 
 // 从 TOML 内容中移除代理写入的配置：
 // - 整段删除 [model_providers.nvidia-proxy]（含 header 与段内所有键）
@@ -117,7 +153,14 @@ function writeProxyConfig(modelId) {
         let topKeys = 'model_provider = "nvidia-proxy"\n' +
             'model = "' + modelId + '"\n' +
             'model_catalog_json = "model-catalog.json"\n';
-        const isThinking = modelId.includes('thinking') || modelId.includes('deepseek-v4-pro') || modelId.includes('kimi-k2');
+        // 显式告知 Codex 该模型的上下文窗口与自动压缩阈值。没有这两项时，
+        // Codex 桌面版对自定义 provider 不会触发自动压缩，会话上下文会一直
+        // 膨胀到几百 MB 才被代理的 413 拦下（实测教训）。阈值取窗口的 70%：
+        // 给压缩摘要的生成本身留出空间（官方模板的 1M 窗口也是配 900K 阈值）。
+        const contextWindow = contextWindowFor(modelId);
+        topKeys += 'model_context_window = ' + contextWindow + '\n';
+        topKeys += 'model_auto_compact_token_limit = ' + Math.floor(contextWindow * AUTO_COMPACT_RATIO) + '\n';
+        const isThinking = isThinkingModel(modelId);
         if (isThinking) {
             topKeys += 'model_reasoning_effort = "high"\n';
         }
@@ -171,8 +214,9 @@ function writeModelCatalog(models) {
             list = [{ id: currentModel, name: currentModel, desc: '' }].concat(list);
         }
         const data = list.map(m => {
-            const isThinking = /thinking|deepseek-v4-pro|kimi-k2/.test(m.id);
+            const isThinking = isThinkingModel(m.id);
             const isVision = isVisionModel(m.id);
+            const contextWindow = contextWindowFor(m.id);
             return {
                 slug: m.id,
                 display_name: m.name,
@@ -201,8 +245,8 @@ function writeModelCatalog(models) {
                 support_verbosity: false,
                 apply_patch_tool_type: 'freeform',
                 truncation_policy: { mode: 'bytes', limit: 10000 },
-                context_window: isThinking ? 1048576 : 131072,
-                max_context_window: isThinking ? 1048576 : 131072,
+                context_window: contextWindow,
+                max_context_window: contextWindow,
                 effective_context_window_percent: 95,
                 supports_parallel_tool_calls: true,
                 experimental_supported_tools: [],
@@ -934,6 +978,9 @@ function forwardRequest(req, bodyStr) {
                 'Content-Type': 'application/json',
                 'Authorization': 'Bearer ' + NVIDIA_API_KEY,
             },
+            // 禁用连接复用，见 NVIDIA_AGENT 处的说明：复用 NIM 已关闭的 socket 会
+            // 让下一次请求在 40s 后才报 ECONNRESET。
+            agent: NVIDIA_AGENT,
             timeout: 300000
         };
 
@@ -1120,6 +1167,20 @@ function stripPrivateMarkup(text) {
     return cleaned;
 }
 
+// 流式净化专用：判断 text 末尾是否是"可能还没收齐的内部标记开头"。
+// NIM 会把标记分片下发（例如把 `<\uFF5CDSML\uFF5C calls>` 拆成 `\n\n<｜DSML｜`
+// 和 ` calls>\n`），逐 delta 做正则替换时两片都不完整、谁都匹配不上，标记就漏进
+// 正文（用户会看到一行 `<tool calls>`）。返回应当扣住（暂不发送）的起始下标：
+// 若尾部是孤立的 `<`（分片边界可能正好切在 `<\uFF5C` 之间），或是 `<\uFF5C` 开头
+// 的片段，就从那里扣住；否则整段都可以安全发出（返回 text.length）。
+function privateMarkupHoldStart(text) {
+    const lt = text.lastIndexOf('<');
+    if (lt === -1) return text.length;
+    const tail = text.slice(lt);
+    if (tail === '<' || tail.startsWith('<\uFF5C')) return lt;
+    return text.length;
+}
+
 function extractTextContent(content) {
     if (typeof content === 'string') return stripPrivateMarkup(content);
     if (Array.isArray(content)) {
@@ -1300,7 +1361,10 @@ async function resolveHostedResponseStreaming(res, chatBody, endpoint) {
         seq: 0,
         clientGone: false,
         upstream: null,
-        model: chatBody.model
+        model: chatBody.model,
+        // 原生 Responses 对象带 created_at（unix 秒）。Codex 回看会话时按它渲染
+        // 每回合的耗时徽章；此前我们不发这个字段，回看里的 working 时长就是空的。
+        createdAt: Math.floor(Date.now() / 1000)
     };
 
     const workingChatBody = JSON.parse(JSON.stringify(chatBody));
@@ -1333,7 +1397,7 @@ async function resolveHostedResponseStreaming(res, chatBody, endpoint) {
         try { raw = await readIncomingMessage(firstResponse); } catch (e) {}
         log('STREAM_MAIN: upstream HTTP ' + firstStatus + ' before stream start, body:', (raw || '').substring(0, 300));
         if (firstStatus === 404) blacklistModel(chatBody.model);
-        res.writeHead(firstStatus, { 'Content-Type': 'application/json' });
+        res.writeHead(codexHttpStatus(firstStatus), { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(codexErrorEnvelope(firstStatus, { message: raw, body: raw }, chatBody.model, endpoint)));
         return;
     }
@@ -1348,12 +1412,12 @@ async function resolveHostedResponseStreaming(res, chatBody, endpoint) {
 
     await writeSseLine(res, JSON.stringify({
         type: 'response.created',
-        response: { id: tempState.responseId, status: 'in_progress', output: [] },
+        response: { id: tempState.responseId, status: 'in_progress', output: [], created_at: tempState.createdAt },
         sequence_number: tempState.seq++
     }));
     await writeSseLine(res, JSON.stringify({
         type: 'response.in_progress',
-        response: { id: tempState.responseId, status: 'in_progress', output: [] },
+        response: { id: tempState.responseId, status: 'in_progress', output: [], created_at: tempState.createdAt },
         sequence_number: tempState.seq++
     }));
     await new Promise(r => setTimeout(r, 100));
@@ -1508,6 +1572,11 @@ function upstreamErrorDetail(statusCode, err, model) {
     } else if (statusCode === 0) {
         cause = 'upstream unreachable after retries: ' + raw;
         advice = 'Check network connectivity, then retry.';
+    } else if (statusCode === 413) {
+        // 本地护栏（不是上游错误）：请求体超过代理上限。此时重试与换模型都
+        // 无济于事——问题出在 Codex 这一次请求本身的大小（会话上下文失控）。
+        cause = 'the request itself exceeds the proxy body limit (256MB)' + (raw ? ': ' + raw : '');
+        advice = 'This conversation context has grown too large — start a new session instead of retrying; retrying or switching models cannot shrink it.';
     } else {
         cause = 'upstream error: ' + raw;
         advice = 'Try again or switch models.';
@@ -1538,6 +1607,21 @@ function codexErrorEnvelope(statusCode, err, model, endpoint) {
         envelope.upstream_status = statusCode;
     }
     return { error: envelope };
+}
+
+// 发给 Codex 的 HTTP 状态码。404 与 413 必须改报 400：对 Codex 而言这些状态码
+// 走的是"意外状态码"兜底路（由本机 logs_2.sqlite 对照证实——同一个 Codex，CC
+// Switch 返回 400 时零重试、Turn error 记录原始 JSON、卡片只显示 error.message；
+// 我们返回 404/413 时无论错误体是最小信封还是完整信封，都会被套上 "unexpected
+// status ... : <body>, url: <url>" 外壳并重采样 5 次，即 UI 上的 "Reconnecting
+// 5/5"；413 的重试文案甚至是 "Reconnecting... waiting for network"）。也就是说
+// Codex 把 400 当"请求本身有问题"（不重试，直接把 body 当错误信息），把其余没
+// 专门处理的状态码当"可重试的意外"（显示时套壳）。上游 404 的语义（该模型对这
+// 台账号不可用）与本地 413 的语义（请求体超上限，重试无益）对 Codex 来说恰好
+// 都是"你这次请求本身有问题"，报 400 不算谎报；真实状态码仍写在 message 的
+// upstream_status 字段里，信息一点不丢。其余状态码一律原样透传。
+function codexHttpStatus(upstreamStatus) {
+    return upstreamStatus === 404 || upstreamStatus === 413 ? 400 : upstreamStatus;
 }
 
 // Terminate a streaming turn with the Responses protocol's failure event so
@@ -1850,9 +1934,118 @@ async function streamSingleRound(res, chatBody, state, roundIndex, preOpenedResp
     let reasonIndex = nextSlot;
     let functionCallItemsAdded = new Set();
 
+    // 思考分段状态：NIM 的思维链是原始大块文本，没有 OpenAI 那种现成的多段摘要。
+    // 这里按换行（整段超长时按句界兜底）切成多个 summary part，**整段缓冲、段落
+    // 成形才一次性发出**。刻意不做段内打字机流式：原生摘要每段只有一句话，打字机
+    // 一行瞬间完成；NIM 的"段"比原生句子长得多，逐字流式会让一行灰字持续增长
+    // （观感就是"超长行+…"闪烁），整段蹦出反而与原生"逐行出现"的观感一致。
+    // partBuffer 是还没凑成段的部分；summaryParts 收集已闭合的段，供
+    // output_item.done 的 summary 数组使用；summaryIndex 是下一段的序号。
+    let partBuffer = '';
+    const summaryParts = [];
+    let summaryIndex = 0;
+    const thinkItemId = state.responseId + '_think_r' + roundIndex;
+
+    // 正文流式净化的尾缓冲（配合 privateMarkupHoldStart）。contentHold 暂存那些
+    // "可能是内部标记开头、但还没收齐"的尾部片段，等后续 delta 到齐再判定：
+    // 确实是标记就丢弃，只是普通文本（如 `a <` 这种代码）就原样补发。正常文本
+    // 最多只被扣 1 个字符（孤立的 `<`），不影响流式观感。
+    let contentHold = '';
+    const feedContent = (delta) => {
+        if (!delta) return '';
+        contentHold = (contentHold + delta).replace(PRIVATE_MARKUP, '');
+        const cut = privateMarkupHoldStart(contentHold);
+        const safe = contentHold.slice(0, cut);
+        contentHold = contentHold.slice(cut);
+        return safe;
+    };
+    // 流结束时调用：把尾缓冲里剩下的东西吐出来。若剩下的仍像是没闭合的标记
+    // （上游被掐断），宁可丢弃也不显示给用户。
+    const flushContent = () => {
+        const tail = contentHold.replace(PRIVATE_MARKUP, '');
+        contentHold = '';
+        return privateMarkupHoldStart(tail) === tail.length ? tail : '';
+    };
+
+    // 把一段已净化的正文增量发给客户端：懒创建 assistant 气泡，再写 delta。
+    // 正常路径每个 delta 调一次；流末尾再用它补发尾缓冲。
+    const emitContentDelta = async (textDelta) => {
+        if (!textDelta) return;
+        fullContent += textDelta;
+        // A reply whose only content was model-internal markup leaves just
+        // whitespace behind — don't open a bubble for it.
+        if (!contentItemAdded && fullContent.trim()) {
+            contentIndex = nextSlot++;
+            contentItemAdded = true;
+            const itemId = state.responseId + '_msg_r' + roundIndex;
+            await writeSseLine(res, JSON.stringify({
+                type: 'response.output_item.added',
+                item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
+                output_index: contentIndex,
+                sequence_number: state.seq++
+            }));
+            await writeSseLine(res, JSON.stringify({
+                type: 'response.content_part.added',
+                part: { id: itemId + '_part0', type: 'output_text', text: '' },
+                item_id: itemId,
+                output_index: contentIndex,
+                content_index: 0,
+                sequence_number: state.seq++
+            }));
+        }
+        if (contentItemAdded) {
+            await writeSseLine(res, JSON.stringify({
+                type: 'response.output_text.delta',
+                delta: textDelta,
+                item_id: state.responseId + '_msg_r' + roundIndex,
+                output_index: contentIndex,
+                content_index: 0,
+                sequence_number: state.seq++
+            }));
+        }
+    };
+
     const messages = chatBody.messages;
 
     log('STREAM_R' + roundIndex + ': starting to process incremental response');
+
+    // 把一段已成形的思考文本作为一个 summary part 整体发出：
+    // part.added → delta → done → part.done，一口气四连。
+    const emitSummaryPart = async (text, idx) => {
+        await writeSseLine(res, JSON.stringify({
+            type: 'response.reasoning_summary_part.added',
+            part: { type: 'summary_text', text: '' },
+            item_id: thinkItemId,
+            output_index: reasonIndex,
+            summary_index: idx,
+            sequence_number: state.seq++
+        }));
+        await writeSseLine(res, JSON.stringify({
+            type: 'response.reasoning_summary_text.delta',
+            delta: text,
+            item_id: thinkItemId,
+            output_index: reasonIndex,
+            summary_index: idx,
+            sequence_number: state.seq++
+        }));
+        await writeSseLine(res, JSON.stringify({
+            type: 'response.reasoning_summary_text.done',
+            text: text,
+            item_id: thinkItemId,
+            output_index: reasonIndex,
+            summary_index: idx,
+            sequence_number: state.seq++
+        }));
+        await writeSseLine(res, JSON.stringify({
+            type: 'response.reasoning_summary_part.done',
+            part: { type: 'summary_text', text: text },
+            item_id: thinkItemId,
+            output_index: reasonIndex,
+            summary_index: idx,
+            sequence_number: state.seq++
+        }));
+        summaryParts.push(text);
+    };
 
     await processResponseIncremental(response, async (delta, usage, finish) => {
         if (usage) addUsageTotals(state.usageTotals, usage);
@@ -1861,7 +2054,9 @@ async function streamSingleRound(res, chatBody, state, roundIndex, preOpenedResp
         // incomplete，否则 Codex 会把一次被掐断的回合当成正常完成。
         if (finish) finishReason = finish;
         const reasoning = extractReasoningText(delta);
-        const textDelta = stripPrivateMarkup(delta.content || '');
+        // 走尾缓冲版净化：内部标记可能分片到达，逐 delta 直接正则替换会漏掉
+        // （见 privateMarkupHoldStart 的注释）。
+        const textDelta = feedContent(delta.content || '');
         const tcDeltas = normalizeToolCalls(delta.tool_calls);
 
         // Log first few deltas to debug model output format
@@ -1901,7 +2096,6 @@ async function streamSingleRound(res, chatBody, state, roundIndex, preOpenedResp
             if (!reasonItemAdded) {
                 reasonIndex = nextSlot++;
                 reasonItemAdded = true;
-                const itemId = state.responseId + '_think_r' + roundIndex;
                 // 发一个原生 `reasoning` 条目，让 Codex 用自己的"思考"样式渲染思维链，
                 // 而不是当成普通回答正文。
                 //
@@ -1912,96 +2106,73 @@ async function streamSingleRound(res, chatBody, state, roundIndex, preOpenedResp
                 // 会读原始思维链的客户端。条目本身两边都带上，谁都能解析。
                 await writeSseLine(res, JSON.stringify({
                     type: 'response.output_item.added',
-                    item: { id: itemId, type: 'reasoning', summary: [], content: [] },
+                    item: { id: thinkItemId, type: 'reasoning', summary: [], content: [] },
                     output_index: reasonIndex,
-                    sequence_number: state.seq++
-                }));
-                await writeSseLine(res, JSON.stringify({
-                    type: 'response.reasoning_summary_part.added',
-                    part: { type: 'summary_text', text: '' },
-                    item_id: itemId,
-                    output_index: reasonIndex,
-                    summary_index: 0,
                     sequence_number: state.seq++
                 }));
             }
-            await writeSseLine(res, JSON.stringify({
-                type: 'response.reasoning_summary_text.delta',
-                delta: reasoning,
-                item_id: state.responseId + '_think_r' + roundIndex,
-                output_index: reasonIndex,
-                summary_index: 0,
-                sequence_number: state.seq++
-            }));
+            // 原始通道照旧逐块流式：Codex 不渲染 reasoning_text 事件，
+            // 这里是留给会读原始思维链的其他客户端的。
             await writeSseLine(res, JSON.stringify({
                 type: 'response.reasoning_text.delta',
                 delta: reasoning,
-                item_id: state.responseId + '_think_r' + roundIndex,
+                item_id: thinkItemId,
                 output_index: reasonIndex,
                 content_index: 0,
                 sequence_number: state.seq++
             }));
+
+            // summary 通道分段：攒进 partBuffer，凑出一段就整体发出（emitSummaryPart）。
+            // 切段规则：遇到换行就切；一直没有换行且攒过 200 字符时，从头部往后找
+            // 第一个句界兜底切一刀——否则"没有换行的思维链"会退化回单个巨长 part，
+            // 显示上又回到折叠的"第一行+…"。guard 只是防御性上限，正常到不了。
+            partBuffer += reasoning;
+            let guard = 0;
+            while (guard++ < 64) {
+                let segText = null;
+                const nl = partBuffer.search(/\r?\n/);
+                if (nl !== -1) {
+                    segText = partBuffer.slice(0, nl);
+                    partBuffer = partBuffer.slice(nl).replace(/^[ \t]*\r?\n/, '');
+                } else if (partBuffer.length > 200) {
+                    const end = firstSentenceEnd(partBuffer, 80);
+                    if (end !== -1) {
+                        segText = partBuffer.slice(0, end + 1);
+                        partBuffer = partBuffer.slice(end + 1);
+                    }
+                }
+                if (segText === null) break;
+                if (!segText.trim()) continue;
+                await emitSummaryPart(segText.trim(), summaryIndex++);
+            }
         }
 
-        if (textDelta && !tcDeltas.some(tc => tc.name === 'web_search')) {
-            fullContent += textDelta;
-            // A reply whose only content was model-internal markup leaves just
-            // whitespace behind — don't open a bubble for it.
-            if (!contentItemAdded && fullContent.trim()) {
-                contentIndex = nextSlot++;
-                contentItemAdded = true;
-                const itemId = state.responseId + '_msg_r' + roundIndex;
-                await writeSseLine(res, JSON.stringify({
-                    type: 'response.output_item.added',
-                    item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
-                    output_index: contentIndex,
-                    sequence_number: state.seq++
-                }));
-                await writeSseLine(res, JSON.stringify({
-                    type: 'response.content_part.added',
-                    part: { id: itemId + '_part0', type: 'output_text', text: '' },
-                    item_id: itemId,
-                    output_index: contentIndex,
-                    content_index: 0,
-                    sequence_number: state.seq++
-                }));
-            }
-            if (contentItemAdded) {
-                await writeSseLine(res, JSON.stringify({
-                    type: 'response.output_text.delta',
-                    delta: textDelta,
-                    item_id: state.responseId + '_msg_r' + roundIndex,
-                    output_index: contentIndex,
-                    content_index: 0,
-                    sequence_number: state.seq++
-                }));
-            }
-        }
+        // 如实输出：即使是发起 web_search 的中间轮，模型说的话也照常转发。
+        // 旧版刻意吞掉搜索轮的文本（初版就有的取舍，当时没写理由）：动机是那轮
+        // 文本几乎总是"我来搜一下X"式过渡语，模型拿到结果后会重新表述一遍，显示
+        // 出来显得重复。但吞显示的代价是 Codex 里操作与解说失去交错感，用户也无从
+        // 知道模型那轮说了什么。文本本来就会进对话历史（见下方 updatedChatBody 的
+        // assistant 消息），所以这里只是放开显示，模型上下文不受影响。
+        await emitContentDelta(textDelta);
     });
 
+    // 流结束：把尾缓冲里扣住的普通文本补发出去（若它其实是没收齐的内部标记，
+    // flushContent 会返回空串，直接丢弃）。
+    await emitContentDelta(flushContent());
+
     if (reasonItemAdded) {
-        log('STREAM_R' + roundIndex + ': reasonItemAdded, fullReasoning=' + fullReasoning.length + ' chars');
-        const itemId = state.responseId + '_think_r' + roundIndex;
-        await writeSseLine(res, JSON.stringify({
-            type: 'response.reasoning_summary_text.done',
-            text: fullReasoning,
-            item_id: itemId,
-            output_index: reasonIndex,
-            summary_index: 0,
-            sequence_number: state.seq++
-        }));
-        await writeSseLine(res, JSON.stringify({
-            type: 'response.reasoning_summary_part.done',
-            part: { type: 'summary_text', text: fullReasoning },
-            item_id: itemId,
-            output_index: reasonIndex,
-            summary_index: 0,
-            sequence_number: state.seq++
-        }));
+        log('STREAM_R' + roundIndex + ': reasonItemAdded, fullReasoning=' + fullReasoning.length
+            + ' chars, summaryParts=' + (summaryParts.length + (partBuffer.trim() ? 1 : 0)));
+        // 收尾：把还没凑成段的尾巴也作为最后一段发出去——不足一段也照发，
+        // 否则这段思考就只留在上下文里、用户看不到。
+        if (partBuffer.trim()) {
+            await emitSummaryPart(partBuffer.trim(), summaryIndex++);
+        }
+        partBuffer = '';
         await writeSseLine(res, JSON.stringify({
             type: 'response.reasoning_text.done',
             text: fullReasoning,
-            item_id: itemId,
+            item_id: thinkItemId,
             output_index: reasonIndex,
             content_index: 0,
             sequence_number: state.seq++
@@ -2009,9 +2180,11 @@ async function streamSingleRound(res, chatBody, state, roundIndex, preOpenedResp
         await writeSseLine(res, JSON.stringify({
             type: 'response.output_item.done',
             item: {
-                id: itemId,
+                id: thinkItemId,
                 type: 'reasoning',
-                summary: [{ type: 'summary_text', text: fullReasoning }],
+                // summary 数组就是逐段发出去的那些段：原生客户端按段渲染成
+                // 多行灰字，回看时是多行列表而不是折叠的"第一行+…"。
+                summary: summaryParts.map(text => ({ type: 'summary_text', text })),
                 content: [{ type: 'reasoning_text', text: fullReasoning }]
             },
             output_index: reasonIndex,
@@ -2092,9 +2265,10 @@ async function streamSingleRound(res, chatBody, state, roundIndex, preOpenedResp
                     status: 'incomplete',
                     incomplete_details: { reason: 'max_output_tokens' },
                     output: [],
+                    created_at: state.createdAt,
                     usage: usageFromTotals(state.usageTotals)
                 }
-                : { id: state.responseId, status: 'completed', output: [], usage: usageFromTotals(state.usageTotals) },
+                : { id: state.responseId, status: 'completed', output: [], created_at: state.createdAt, usage: usageFromTotals(state.usageTotals) },
             sequence_number: state.seq++
         }));
         log('STREAM_R' + roundIndex + ': finished, finish_reason=' + finishReason + ', content=' + fullContent.length + 'ch, reasoning=' + fullReasoning.length + 'ch');
@@ -2179,7 +2353,7 @@ async function streamSingleRound(res, chatBody, state, roundIndex, preOpenedResp
         }
         await writeSseLine(res, JSON.stringify({
             type: 'response.completed',
-            response: { id: state.responseId, status: 'completed', output: [], usage: usageFromTotals(state.usageTotals) },
+            response: { id: state.responseId, status: 'completed', output: [], created_at: state.createdAt, usage: usageFromTotals(state.usageTotals) },
             sequence_number: state.seq++
         }));
         await writeSseRaw(res, 'data: [DONE]\n\n');
@@ -2187,6 +2361,17 @@ async function streamSingleRound(res, chatBody, state, roundIndex, preOpenedResp
 
     state.nextSlot = nextSlot;
     return streamResult;
+}
+
+// 在 text 里从 minIndex 往后找第一个句子结束标点（。！？；.!?;），返回该标点的
+// 下标；找不到返回 -1。用于给"整段没有换行"的思维链兜底切段：从头部往后找，
+// 每刀切出 ~minIndex 起步的短段，段与段之间逐次推进，显示上灰字才能逐行出现
+// （若从尾部往前找，一刀会切出接近全长的大段，等于没切）。
+function firstSentenceEnd(text, minIndex) {
+    for (let i = Math.max(0, minIndex); i < text.length; i++) {
+        if ('。！？；.!?;'.indexOf(text[i]) !== -1) return i;
+    }
+    return -1;
 }
 
 async function readIncomingMessageLines(response) {
@@ -2248,6 +2433,8 @@ function splitTextIntoChunks(text, maxLen) {
 
 async function streamResponseObject(res, responseObject, skipHeader) {
     let seq = 0;
+    // 非流式路径的重放也要带 created_at，理由同流式路径（回看耗时徽章）。
+    const createdAt = responseObject.created_at || Math.floor(Date.now() / 1000);
 
     async function sendEvent(event) {
         if (!event.sequence_number) {
@@ -2259,11 +2446,11 @@ async function streamResponseObject(res, responseObject, skipHeader) {
     if (!skipHeader) {
         await sendEvent({
             type: 'response.created',
-            response: { id: responseObject.id, status: 'in_progress', output: [] }
+            response: { id: responseObject.id, status: 'in_progress', output: [], created_at: createdAt }
         });
         await sendEvent({
             type: 'response.in_progress',
-            response: { id: responseObject.id, status: 'in_progress', output: [] }
+            response: { id: responseObject.id, status: 'in_progress', output: [], created_at: createdAt }
         });
     }
 
@@ -2416,6 +2603,7 @@ async function streamResponseObject(res, responseObject, skipHeader) {
             id: responseObject.id,
             status: 'completed',
             output: responseObject.output,
+            created_at: createdAt,
             usage: responseObject.usage
         }
     });
@@ -2523,9 +2711,33 @@ function buildNonStreamResponse(chatResp) {
 
 const proxyServer = http.createServer(async (req, res) => {
     if (req.method === 'POST' && req.url === '/v1/responses') {
-        let body = '';
-        req.on('data', chunk => body += chunk);
+        // 请求体用 Buffer 数组累积，而不是 `body += chunk` 字符串拼接。
+        // 后者在 Codex 发来超大请求体（超长会话 / 大图 base64）时会撞上 V8 的
+        // 字符串长度上限（约 5 亿字符），抛 RangeError——而 'data' 回调跑在
+        // 事件发射器里，外层 try/catch 罩不住，直接 uncaughtException 杀死
+        // 整个代理进程（proxy-crash.log 里的 "Invalid string length" 就是它）。
+        // Buffer.concat 没有这个上限，且再配一个硬上限：超过就回 413 拒掉，
+        // 因为这么大的请求体 NIM 也消化不了，攒下去只会白烧内存。
+        const MAX_BODY_BYTES = 256 * 1024 * 1024;
+        const bodyChunks = [];
+        let bodyBytes = 0;
+        let bodyTooLarge = false;
+        req.on('data', chunk => {
+            if (bodyTooLarge) return;
+            bodyBytes += chunk.length;
+            if (bodyBytes > MAX_BODY_BYTES) {
+                bodyTooLarge = true;
+                log('Request body exceeds ' + MAX_BODY_BYTES + ' bytes, rejecting with 413');
+                res.writeHead(413, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(codexErrorEnvelope(413, { message: 'request body too large (over 256MB)' }, '', req.url)));
+                req.destroy();
+                return;
+            }
+            bodyChunks.push(chunk);
+        });
         req.on('end', async () => {
+            if (bodyTooLarge) return;
+            const body = Buffer.concat(bodyChunks).toString('utf8');
             try {
                 const responsesBody = JSON.parse(body);
                 const chatBody = convertRequest(responsesBody);
@@ -2610,7 +2822,7 @@ const proxyServer = http.createServer(async (req, res) => {
                     // "stream disconnected before completion:" 前缀——因为 Codex 并不把
                     // response.failed 视为回合结束事件，会把它当成"未完成断流"而重试 5 次。
                     // 流式与非流式在此统一处理（此前流式分支还额外多发了一对 created/in_progress）。
-                    res.writeHead(404, { 'Content-Type': 'application/json' });
+                    res.writeHead(codexHttpStatus(404), { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify(codexErrorEnvelope(404, { message: 'model is on the proxy blacklist (NIM does not serve it)' }, chatBody.model, req.url)));
                     return;
                 }
@@ -2624,7 +2836,7 @@ const proxyServer = http.createServer(async (req, res) => {
                         if (statusCode === 404) blacklistModel(chatBody.model);
                         // 上游失败直通 HTTP 状态码 + 结构化错误体，而不是 200 + 伪装成
                         // 正常回复——非流式客户端（含 Codex compact 等）能看到真实失败。
-                        res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+                        res.writeHead(codexHttpStatus(statusCode), { 'Content-Type': 'application/json' });
                         res.end(JSON.stringify(codexErrorEnvelope(statusCode, e, chatBody.model, req.url)));
                         return;
                     }
