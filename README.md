@@ -32,7 +32,7 @@ Windows 用户也可以直接双击 `start_proxy.bat`。
 
 代理启动时会自动接管 `~/.codex/config.toml`，把 `model_provider` 指向本地代理，把 NVIDIA 的模型写入 Codex 模型目录，并按上下文窗口写好 `model_context_window` 与自动压缩阈值（Codex 对自定义 provider 默认不自动压缩，长会话会一路把上下文撑大；写上这两项后 Codex 会在接近上限时自动压缩）。窗口用核实过的值：GLM-5.3 为 1M，Kimi K2 为 256K，其余按 128K 保守估计。全程不需要手改任何配置。启动后打开 Codex 选模型：桌面版用模型下拉框，CLI 用 `/model`。
 
-关掉代理请按 `Ctrl+C`，`config.toml` 会还原成启动前的样子。直接杀进程（任务管理器结束任务、关掉终端窗口）不会触发还原，恢复办法见[常见问题](#常见问题)里的「退出代理后 `config.toml` 会怎样？」。
+**用 `Ctrl+C` 退出**，代理会把 `config.toml` 还原成启动前的样子。直接杀进程（任务管理器结束任务、关掉终端窗口）不会触发还原，`config.toml` 会留在指向已经停掉的 `15721` 的状态——这时运行 `node responses_proxy.cjs --restore` 就能退回原配置：只还原，不启动服务，也不需要 API Key。接管与还原的细节、手工恢复步骤见[常见问题](#常见问题)。
 
 ## 支持的模型
 
