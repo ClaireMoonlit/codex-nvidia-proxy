@@ -193,10 +193,10 @@ NIM proxy failed while handling /responses. Provider: NVIDIA NIM; model: <模型
 <details>
 <summary><b>回复里出现 <code>NIM proxy:</code> 开头的引用块？</b></summary>
 
-那是一条代理提示，不是模型正文，只有两种来源：
+那是一条代理提示，不是模型正文。现在只剩两种情况会这样显示：
 
-- **模型这一轮什么都没产出**——只吐了会被过滤掉的内部标记，或者干脆空回复。重试一次，或换一个模型。
-- **托管搜索的轮数用尽**——6 轮之内没有给出最终回答。换个问法，或把已知信息直接告诉它。
+- **`NIM proxy: empty reply from the model`** —— 模型这一轮什么都没产出：只吐了会被过滤掉的内部标记，或者干脆空回复。重试一次，或换一个模型。
+- **`NIM proxy: web search limit reached`** —— 托管搜索的 6 轮预算用尽，模型仍未给出最终回答。换个问法，或把已知信息直接告诉它。
 
 上游真正出错（额度、限流、Key、模型不可用、网络）不走引用块，而是走上面那条错误卡片。
 
