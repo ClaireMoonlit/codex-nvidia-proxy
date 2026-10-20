@@ -230,7 +230,10 @@ function writeProxyConfig(modelId) {
         // 行、也抄不到键"，反过来把上一步刚登记的原值判成过期清掉（实测 5 个用例
         // 里 3 个因此还原失败）。
         // 先移除旧的代理配置，但保留用户自定义的其它 provider 段（如 custom）
-        content = removeProxyConfig(content).trim();
+        // 只去尾部空白，不 trim 头部：删掉顶层键后文件开头会剩下原本分隔
+        // "顶层键 ↔ 第一个 section"的空行，头部一 trim 就永久丢了，退出时
+        // 还原出来的文件比原文件少一行（实测 diff 噪音）。
+        content = removeProxyConfig(content).replace(/\s+$/, '');
 
         // 顶层键必须写在任何 [section] header 之前，否则 TOML 作用域会出错
         // （写在末尾会被并入最后一个 section，Codex 会读不到）。
@@ -350,15 +353,6 @@ function writeModelCatalog(models) {
         console.warn('[Proxy] Failed to write model catalog:', e.message);
     }
 }
-
-process.on('SIGINT', () => {
-    stripProxyConfig(true);
-    process.exit(0);
-});
-process.on('SIGTERM', () => {
-    stripProxyConfig(true);
-    process.exit(0);
-});
 
 // `--restore`：只还原配置，不启动代理。硬杀代理后 config.toml 会一直指向已经
 // 停掉的 15721，而还原只在"代理自己正常退出"时发生；这个入口让用户不必再完整
@@ -510,8 +504,21 @@ function recordCrash(kind, err) {
 process.on('uncaughtException', (err) => { recordCrash('uncaughtException', err); process.exit(1); });
 process.on('unhandledRejection', (reason) => { recordCrash('unhandledRejection', reason); process.exit(1); });
 appendCrashLog('[' + new Date().toISOString() + '] START pid=' + process.pid + ' node=' + process.version + '\n');
-process.on('SIGINT', () => { appendCrashLog('[' + new Date().toISOString() + '] SIGNAL SIGINT pid=' + process.pid + ' (Ctrl+C)\n'); process.exit(130); });
-process.on('SIGTERM', () => { appendCrashLog('[' + new Date().toISOString() + '] SIGNAL SIGTERM pid=' + process.pid + '\n'); process.exit(143); });
+// 信号 = 正常退出：先还原 config.toml，再留档。顺序不能反，还原要在 exit 之前完成。
+// 退出码沿用 0（与"正常退出"一致），靠 SIGNAL 行区分是 Ctrl+C 还是自然收尾。
+// 这里是信号的**唯一**处理点：此前文件上方另有一组"先还原再 exit(0)"的处理器，
+// 注册顺序在前，信号总被它吞掉，SIGNAL 一次都没写进日志（实测两次 Ctrl+C 只有
+// EXIT code=0）。两组合并后不要再新增第二处信号入口，否则又会静默盖掉留档。
+process.on('SIGINT', () => {
+    stripProxyConfig(true);
+    appendCrashLog('[' + new Date().toISOString() + '] SIGNAL SIGINT pid=' + process.pid + ' (Ctrl+C)\n');
+    process.exit(0);
+});
+process.on('SIGTERM', () => {
+    stripProxyConfig(true);
+    appendCrashLog('[' + new Date().toISOString() + '] SIGNAL SIGTERM pid=' + process.pid + '\n');
+    process.exit(0);
+});
 // 退出码/时长与 START 配对即可还原进程一生（崩溃路径也会走到这里，因为崩溃处理里同样 process.exit）。
 process.on('exit', (code) => { appendCrashLog('[' + new Date().toISOString() + '] EXIT code=' + code + ' pid=' + process.pid + ' uptime=' + Math.round((Date.now() - PROCESS_STARTED_AT) / 1000) + 's\n'); });
 

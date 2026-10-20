@@ -30,17 +30,15 @@ node responses_proxy.cjs
 
 Windows 用户也可以直接双击 `start_proxy.bat`。
 
-代理启动时会自动接管 `~/.codex/config.toml`，把 `model_provider` 指向本地代理，把 NVIDIA 的模型写入 Codex 模型目录，并按模型的真实窗口大小写好 `model_context_window` 与自动压缩阈值（Codex 对自定义 provider 默认不自动压缩，长会话会一路把上下文撑大；写上这两项后 Codex 会在接近上限时自动压缩）。全程不需要手改任何配置。启动后打开 Codex 选模型：桌面版用模型下拉框，CLI 用 `/model`。
+代理启动时会自动接管 `~/.codex/config.toml`，把 `model_provider` 指向本地代理，把 NVIDIA 的模型写入 Codex 模型目录，并按上下文窗口写好 `model_context_window` 与自动压缩阈值（Codex 对自定义 provider 默认不自动压缩，长会话会一路把上下文撑大；写上这两项后 Codex 会在接近上限时自动压缩）。窗口用核实过的值：GLM-5.3 为 1M，Kimi K2 为 256K，其余按 128K 保守估计。全程不需要手改任何配置。启动后打开 Codex 选模型：桌面版用模型下拉框，CLI 用 `/model`。
 
-关掉代理（在启动它的窗口按 `Ctrl+C`）会自动还原原始配置，Codex 回到只用 OpenAI 官方模型的状态。请用 `Ctrl+C` 退出：直接杀进程（任务管理器结束任务、关掉终端窗口）不会触发还原，`config.toml` 会留在指向本代理的状态，Codex 会连不上已经停掉的 `15721`。原值不会丢——它记在 `model_state.json` 里，下次启动代理时重新接管，下次正常退出时再还回去。
-
-如果已经这么杀过、又不想再起一轮代理，在项目目录运行 `node responses_proxy.cjs --restore` 退回原配置：它只做还原，不启动服务，也不需要 API Key。也可以手工删掉 `config.toml` 顶部以 `model_provider = "nvidia-proxy"` 开头的那几行顶层键，以及文件末尾的 `[model_providers.nvidia-proxy]` 段。
+关掉代理请按 `Ctrl+C`，`config.toml` 会还原成启动前的样子。直接杀进程（任务管理器结束任务、关掉终端窗口）不会触发还原，恢复办法见[常见问题](#常见问题)里的「退出代理后 `config.toml` 会怎样？」。
 
 ## 支持的模型
 
 ![Codex 模型下拉框中的 NIM 模型列表](docs/images/model-picker.png)
 
-代理每次启动时都会从 NVIDIA 拉取当前可用的全部模型，写进 Codex 的 `model-catalog.json`，在 `/model` 和桌面版下拉框里直接可选，不需要手动配置。
+代理每次启动时都会从 NVIDIA 拉取当前账号可用的对话模型，写进 Codex 的 `model-catalog.json`，在 `/model` 和桌面版下拉框里直接可选，不需要手动配置。embedding、rerank、安全审核、语音等非对话模型会被自动过滤掉；拉取失败时回落到项目里的 `models.json`。
 
 下面是 2026-10 实测可用的代表性模型：
 
@@ -72,10 +70,10 @@ NVIDIA 会不时上架和下架模型，具体以 Codex 客户端里的实时列
 - **思考过程完整呈现** — 模型思维链同时以 Codex 认识的 summary 通道（界面灰字）和原始 `reasoning_text` 通道（供其他客户端）双路输出，条目与流式事件两边都带，任何客户端都能各取所需。详见[思考过程的显示](#思考过程的显示)。
 - **截断如实上报** — 上游响应若因输出长度被截断（`finish_reason=length`），代理向 Codex 上报 `incomplete` 而不是伪装成正常完成，避免"话没说完、工具没发全"的回合被静默吞掉。
 - **模型目录实时同步** — 启动时从 NIM 拉取可用模型，过滤掉非对话模型，写入 Codex 模型目录。
-- **配置自动来回** — 启动接管、退出还原，不留残留。
-- **失效模型自动屏蔽** — 返回 404 的模型自动移出列表（想重新测就删 `model_blacklist.json` 再重启）。
-- **自动重试** — 网络抖动或服务繁忙时自动重试。
-- **报错清晰可辨** — 代理产生的报错以引用块显示（`NIM proxy:` 开头），并按原因区分：额度用尽、被限流、Key 被拒、模型不可用，不会和模型正文混在一起。
+- **配置自动来回** — 启动接管、退出还原，不留残留；硬杀后可用 `--restore` 一条命令救回（见[常见问题](#常见问题)）。
+- **失效模型自动屏蔽** — 返回 404 的模型自动移出列表，24 小时后自动解禁；想马上重测就删 `model_blacklist.json` 再重启。
+- **自动重试** — 遇到 429、503 或连接失败时最多重试 5 次，指数退避并尊重上游的 `Retry-After`。
+- **报错清晰可辨** — 上游失败走 Codex 自己的错误卡片，消息里写明模型、真实状态码、原因和处理建议；只有"模型这一轮什么都没产出"和"搜索轮数用尽"这类软提示才以 `NIM proxy:` 开头的引用块显示。
 - **零依赖单文件** — 只用 Node.js 内置模块，不需要 `npm install`。
 
 ## 架构
@@ -128,7 +126,32 @@ Codex 桌面版/CLI 的界面只渲染 reasoning 条目的 **summary 通道**（
 | `NVIDIA_API_KEY` | NVIDIA NIM API Key，**必需** | 无 |
 | `DEBUG` | 打印详细调试日志（需设为 `true`） | `false` |
 
+两个变量都可以写进项目根目录的 `.env`（代理启动时自动读取；已经在环境里设置过的变量优先）。`DEBUG=true` 时还会把 Codex 实际下发的工具列表 dump 到 `tool_dump.json`，方便排查"某个工具没被识别"的问题。
+
 ## 常见问题
+
+<details>
+<summary><b>退出代理后 <code>config.toml</code> 会怎样？</b></summary>
+
+代理启动时会把自己要用的顶层键（`model_provider`、`model`、`model_catalog_json`、窗口与推理相关的那几项）和 `[model_providers.nvidia-proxy]` 段写进 `config.toml`。接管之前这些键原本是什么值，会先抄进 `model_state.json`。
+
+正常退出（在启动它的窗口按 `Ctrl+C`）会删掉代理写的键和段，把抄下来的原值放回文件顶部，`config.toml` 逐字节回到启动前的样子。
+
+直接杀进程（任务管理器结束任务、关掉终端窗口）不会触发这套还原，`config.toml` 会留在指向本代理的状态，Codex 会连不上已经停掉的 `15721`。这种情况下：
+
+- 在项目目录运行 `node responses_proxy.cjs --restore`：只还原，不启动服务，也不需要 API Key；
+- 或者手工删掉 `config.toml` 顶部以 `model_provider = "nvidia-proxy"` 开头的那几行顶层键，以及文件末尾的 `[model_providers.nvidia-proxy]` 段。
+
+原值记在 `model_state.json` 里，不会因为硬杀而丢。如果这期间别的工具（比如 cc-switch）整份重写过 `config.toml`，代理会认为旧原值已经过期并丢弃它，避免把过期配置盖回别人刚写好的文件。
+
+</details>
+
+<details>
+<summary><b>启动时报 <code>EADDRINUSE</code>：127.0.0.1:15721 已被占用？</b></summary>
+
+代理固定监听 `127.0.0.1:15721`。cc-switch 之类的工具切到"NIM 本地代理"模式时也用同一个端口，两者同一时刻只能跑一个。先关掉另一个，再启动本代理。
+
+</details>
 
 <details>
 <summary><b>模型列表里没有刚上架的新模型？</b></summary>
@@ -145,13 +168,37 @@ Codex 只在启动时读一次模型列表，重启 Codex 客户端即可看到�
 </details>
 
 <details>
+<summary><b>Codex 弹出一条 <code>NIM proxy failed while handling /responses</code> 的错误？</b></summary>
+
+这是代理把上游失败如实转给 Codex，卡片里的消息形如：
+
+```
+NIM proxy failed while handling /responses. Provider: NVIDIA NIM; model: <模型>; upstream_status: HTTP <状态码>; cause: <原因>. <建议>
+```
+
+按 `cause` 处理：
+
+- **额度用尽（402）**——该 NVIDIA 账号的免费额度用完了，换一个 Key（或付费端点），换模型没用。
+- **被限流（429）**——免费层有每分钟请求数限制（因模型而异），代理会自动重试几次，仍失败就稍等再试。
+- **API Key 被拒（401/403）**——检查 `.env` 里的 `NVIDIA_API_KEY`，重启代理。
+- **模型不可用（404）**——该模型对这个账号不可用，已被移出列表，换一个。
+- **服务端错误（5xx）**——稍等重试，或换模型。
+- **连不上上游（`upstream_status: HTTP unreachable`）**——重试若干次后仍无响应，检查网络。
+- **请求体超过 256MB**——会话上下文膨胀失控，换新会话；重试和换模型都救不回来。
+
+模型不可用（上游 404）时代理还会把 HTTP 状态改报 400：Codex 会把没专门处理的错误状态码当成"可重试的意外"，在界面上反复 "Reconnecting" 并重采样；400 则直接显示错误信息。真实状态码仍写在消息的 `upstream_status` 里，信息不丢。
+
+</details>
+
+<details>
 <summary><b>回复里出现 <code>NIM proxy:</code> 开头的引用块？</b></summary>
 
-那是代理产生的提示，不是模型回复，块里会写明原因和处理办法：
+那是一条代理提示，不是模型正文，只有两种来源：
 
-- **额度用尽（402）**——该 NVIDIA 账号的免费额度用完了，换一个 Key（或付费端点）再试，换模型没用。
-- **被限流（429）**——免费层有每分钟请求数限制（因模型而异），代理会自动重试几次，仍失败就稍等再试。
-- **API Key 被拒（401/403）**——检查 `.env` 里的 `NVIDIA_API_KEY`。
+- **模型这一轮什么都没产出**——只吐了会被过滤掉的内部标记，或者干脆空回复。重试一次，或换一个模型。
+- **托管搜索的轮数用尽**——6 轮之内没有给出最终回答。换个问法，或把已知信息直接告诉它。
+
+上游真正出错（额度、限流、Key、模型不可用、网络）不走引用块，而是走上面那条错误卡片。
 
 </details>
 
@@ -174,16 +221,33 @@ Invoke-WebRequest -Uri http://127.0.0.1:15721/v1/responses -Method POST -Body $b
 
 </details>
 
+<details>
+<summary><b>代理突然没了，怎么查它怎么退出的？</b></summary>
+
+看项目目录里的 `proxy-crash.log`。每次启动写 `START`，收到信号写 `SIGNAL`，退出写 `EXIT code=<退出码> ... uptime=<存活秒数>`：
+
+- 有 `START` 没有对应的 `EXIT`——进程被硬杀（关终端窗口、任务管理器结束任务），`config.toml` 也就没被还原；
+- 有 `SIGNAL SIGINT`——在窗口里按了 `Ctrl+C`，配置已还原；
+- 只有 `EXIT code=0`、前面没有 `SIGNAL`——正常收尾；
+- 有 `uncaughtException` / `unhandledRejection`——崩溃，后面跟着完整堆栈；启动即退的 `EXIT code=1` 多为端口被占用（日志里有 `EADDRINUSE`）或没读到 API Key（终端里会先打一行提示）。
+
+文件超过 256KB 会自动清空重写，不会无限增长。
+
+</details>
+
 ## 项目结构
 
 ```
 codex-nvidia-proxy/
 ├── responses_proxy.cjs    # 主代理（单文件，零依赖）
 ├── start_proxy.bat        # Windows 启动脚本
+├── .env                   # 你的 API Key（不入库，从 .env.example 复制）
 ├── .env.example           # API Key 配置模板
 ├── models.json            # 内置兜底模型列表（拉不到实时列表时才用）
-├── model_state.json       # 当前选中的模型（自动生成）
-├── model_blacklist.json   # 不可用模型黑名单（自动生成）
+├── model_state.json       # 当前选中的模型 + 被接管的原始配置值（自动生成）
+├── model_blacklist.json   # 不可用模型黑名单，24 小时自动过期（自动生成）
+├── proxy-crash.log        # 进程存亡记录：启动、信号、退出码、崩溃堆栈（自动生成）
+├── tool_dump.json         # Codex 下发的工具列表，仅 DEBUG=true 时生成
 ├── docs/images/           # README 配图
 ├── package.json           # 项目元数据（无外部依赖）
 └── LICENSE
