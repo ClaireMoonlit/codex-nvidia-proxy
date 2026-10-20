@@ -61,7 +61,22 @@ const MAX_HOSTED_WEB_SEARCH_ROUNDS = 6;
 
 // 顶层由代理负责写入/清理的键（不属于任何 [section]）。
 // 清理时只对这些键动手，绝不改动用户自己定义的其它 provider 段。
-const PROXY_TOP_KEYS = /^(api_base_url|model_provider|model|model_catalog_json|model_context_window|model_auto_compact_token_limit|model_reasoning_effort|model_reasoning_summary|model_supports_reasoning_summaries|show_raw_agent_reasoning|hide_agent_reasoning)\s*=/;
+//
+// 但这几个键是 Codex 的"单选"键：代理运行期间必须占用（model_provider 指向
+// nvidia-proxy、model 是我们提供的 slug），而它们的原值很可能是别的工具写的
+// ——实测 cc-switch 的 Nvidia 预设在顶层写 model_provider="custom"、
+// model="z-ai/glm-5.3-flash"、model_catalog_json="cc-switch-model-catalog.json"、
+// model_reasoning_effort="medium"，全部命中下面这份名单。因此启动时要先把原值
+// 抄进 model_state.json，退出时再原样还回去；否则用户原先选中的 provider 会被
+// 永久抹掉（表现为"换过 provider 之后 Codex 不认原有的历史线程"）。
+const PROXY_TOP_KEY_NAMES = [
+    'api_base_url', 'model_provider', 'model', 'model_catalog_json',
+    'model_context_window', 'model_auto_compact_token_limit',
+    'model_reasoning_effort', 'model_reasoning_summary',
+    'model_supports_reasoning_summaries', 'show_raw_agent_reasoning',
+    'hide_agent_reasoning'
+];
+const PROXY_TOP_KEYS = new RegExp('^(' + PROXY_TOP_KEY_NAMES.join('|') + ')\\s*=');
 const PROXY_PROVIDER_SECTION = 'model_providers.nvidia-proxy';
 
 // 上下文窗口（token）——只收录经官网核实过的值，未列出的模型一律保守按 128K。
@@ -88,7 +103,7 @@ function isThinkingModel(modelId) {
 // - 删除顶层（尚未进入任何 [section]）的代理键
 // 其余内容（例如用户自定义的 [model_providers.custom] 等）原样保留，
 // 这样历史线程引用的其它 provider 名不会因代理启动/退出而被破坏。
-function removeProxyConfig(content) {
+function removeProxyConfig(content, restoreLines) {
     const lines = content.split(/\r?\n/);
     const out = [];
     let currentSection = null;
@@ -123,16 +138,72 @@ function removeProxyConfig(content) {
         }
         result.push(line);
     }
+    // 把启动时抄下的原顶层键放回文件最前面。必须是 unshift 而不是 push：顶层键
+    // 只能出现在任何 [section] 之前，追加到末尾会被 TOML 并入最后一个 section。
+    // 这些键在同一函数的前一段循环里已被整行删除，所以不会与残留行重复。
+    if (Array.isArray(restoreLines) && restoreLines.length > 0) {
+        result.unshift(...restoreLines);
+    }
     return result.join('\n');
 }
 
-function stripProxyConfig() {
+// 读/合并写 model_state.json。用合并写（而不是整份覆盖）是为了让 restoreTopKeys
+// 与 model 两个字段互不覆盖——两处调用点各自只知道自己那一个字段。
+function readState() {
+    try {
+        if (fs.existsSync(MODEL_STATE_PATH)) {
+            return JSON.parse(fs.readFileSync(MODEL_STATE_PATH, 'utf-8')) || {};
+        }
+    } catch (e) {}
+    return {};
+}
+
+function writeState(patch) {
+    try {
+        fs.writeFileSync(MODEL_STATE_PATH, JSON.stringify(Object.assign(readState(), patch)), 'utf-8');
+    } catch (e) {}
+}
+
+// 抄取"第一个 [section] 之前"的顶层键原始行，只留代理会占用的那些。
+// 只认 `key = value` 行：注释行不复制，以免把别人的注释也一并搬来搬去。
+function captureTopLevelKeys(content) {
+    const captured = [];
+    for (const line of content.split(/\r?\n/)) {
+        if (/^\s*\[([^\]]*)\]\s*$/.test(line)) break;
+        const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/);
+        if (m && PROXY_TOP_KEY_NAMES.includes(m[1])) {
+            captured.push(line);
+        }
+    }
+    return captured;
+}
+
+// 把"别人写的"顶层键原值登记进 state，供退出时还原。**必须在真正删除键之前调用**
+// ——一旦删掉，原值就再也找不回来。第一版把它放在删除之后的 writeProxyConfig 里，
+// 测试实测 state 存下来的是空数组、退出后原值全丢，因此改到本节。
+// 已经是我们写的值（文件里有标志行）不登记，否则会把我们自己的 slug 当原值存起来。
+function noteOriginals(content) {
+    if (/^\s*model_provider\s*=\s*"nvidia-proxy"/m.test(content)) return;
+    const captured = captureTopLevelKeys(content);
+    if (captured.length > 0) writeState({ restoreTopKeys: captured });
+}
+
+// `restore` 为 true 时把 state 里登记的原值还原回文件并清空登记（退出路径）；
+// 为 false 时只做清理（启动路径：上一轮若已正常退出，原值早就还原过了，再还原
+// 一次反而会把用户后来手动改的值顶掉）。
+function stripProxyConfig(restore) {
     try {
         if (!fs.existsSync(CONFIG_PATH)) return;
         const before = fs.readFileSync(CONFIG_PATH, 'utf-8');
-        const content = removeProxyConfig(before).trimEnd();
+        noteOriginals(before);
+        const state = readState();
+        const restoreLines = restore && Array.isArray(state.restoreTopKeys) ? state.restoreTopKeys : [];
+        const content = removeProxyConfig(before, restoreLines).trimEnd();
         if (content !== before.trimEnd()) {
             fs.writeFileSync(CONFIG_PATH, content ? content + '\n' : '', 'utf-8');
+        }
+        if (restore && restoreLines.length > 0) {
+            writeState({ restoreTopKeys: null });
         }
     } catch (e) {
         console.warn('[Proxy] Failed to strip proxy config:', e.message);
@@ -145,6 +216,9 @@ function writeProxyConfig(modelId) {
         if (fs.existsSync(CONFIG_PATH)) {
             content = fs.readFileSync(CONFIG_PATH, 'utf-8');
         }
+        // 兜底再登记一次（常规路径已在 stripProxyConfig 里登记过；这里覆盖"strip
+        // 之后 state 被清空、而文件顶层仍留着别人的值"这种边角情形）。
+        noteOriginals(content);
         // 先移除旧的代理配置，但保留用户自定义的其它 provider 段（如 custom）
         content = removeProxyConfig(content).trim();
 
@@ -172,13 +246,19 @@ function writeProxyConfig(modelId) {
         // reasoning outright when it is on, and its default differs per client.
         topKeys += 'model_reasoning_summary = "detailed"\nmodel_supports_reasoning_summaries = true\nshow_raw_agent_reasoning = true\nhide_agent_reasoning = false\n';
 
-        const providerConfig = topKeys + '\n' +
-            '[model_providers.nvidia-proxy]\n' +
+        const providerSection = '[model_providers.nvidia-proxy]\n' +
             'name = "NVIDIA NIM Proxy"\n' +
             'base_url = "http://127.0.0.1:15721/v1"\n' +
             'wire_api = "responses"\n';
 
-        content = providerConfig + '\n' + content;
+        // 段写在文件末尾，不紧跟顶层键：若写在前头，用户原本位于顶层的其它键
+        // （实测 cc-switch 写的 disable_response_storage = true）会被挤到我们那段
+        // header 之后、变成"我们段内的键"，退出时按段整段删除就把用户的键永久
+        // 吃掉了。段放末尾则用户的顶层键仍留在任何 header 之前，TOML 语义不变
+        // （section 之间顺序无关），也不会被当成我们的键删掉。
+        // 顶层键与用户第一行之间不插空行：退出时我们把顶层键整行删掉，若中间有
+        // 空行它会被留下，还原出来的文件就比原文件多一行空行（实测 diff 噪音）。
+        content = topKeys + content + '\n' + providerSection;
 
         fs.writeFileSync(CONFIG_PATH, content, 'utf-8');
     } catch (e) {
@@ -262,11 +342,11 @@ function writeModelCatalog(models) {
 }
 
 process.on('SIGINT', () => {
-    stripProxyConfig();
+    stripProxyConfig(true);
     process.exit(0);
 });
 process.on('SIGTERM', () => {
-    stripProxyConfig();
+    stripProxyConfig(true);
     process.exit(0);
 });
 
@@ -415,7 +495,8 @@ process.on('exit', (code) => { appendCrashLog('[' + new Date().toISOString() + '
 
 let currentModel = getCurrentModelFromFile();
 
-stripProxyConfig();
+// 启动时不还原原值（restore=false），只登记 + 清理；原值的还原统一由退出路径负责。
+stripProxyConfig(false);
 
 // Write the proxy config synchronously right after stripping so config.toml
 // is never left provider-less (a concurrently starting Codex could otherwise
@@ -440,7 +521,7 @@ function applyStartupModels(models, live) {
         // chat model instead of leaving a dead slug in config.toml.
         currentModel = MODELS.length > 0 ? MODELS[0].id : null;
         if (currentModel) {
-            try { fs.writeFileSync(MODEL_STATE_PATH, JSON.stringify({ model: currentModel }), 'utf-8'); } catch (e) {}
+            writeState({ model: currentModel });
             writeProxyConfig(currentModel);
         }
     }
@@ -456,11 +537,9 @@ fetchNvidiaModels()
 
 function getCurrentModelFromFile() {
     try {
-        if (fs.existsSync(MODEL_STATE_PATH)) {
-            const state = JSON.parse(fs.readFileSync(MODEL_STATE_PATH, 'utf-8'));
-            if (state.model && typeof state.model === 'string') {
-                return state.model;
-            }
+        const state = readState();
+        if (state.model && typeof state.model === 'string') {
+            return state.model;
         }
     } catch (e) {}
     try {
