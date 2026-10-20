@@ -1401,14 +1401,9 @@ function buildResponseObjectFromState(state) {
     }
 
     // Nothing the user can act on came back (no answer, no tool call).
+    // 走错误出口而不是塞一条假回复：由调用方转成原生错误卡片。
     if (!output.some(o => o.type === 'message' || o.type === 'function_call' || o.type === 'custom_tool_call')) {
-        output.push({
-            type: 'message',
-            id: responseId + '_empty',
-            role: 'assistant',
-            status: 'completed',
-            content: [{ type: 'output_text', text: emptyReplyText(state.model) }]
-        });
+        throw proxyNotice(emptyReplyMessage(state.model));
     }
 
     return {
@@ -1630,13 +1625,23 @@ function finishSseIfOpen(res) {
     }
 }
 
-// Codex does not render `type: 'error'` SSE events, so proxy-side notices (empty
-// turn, web-search budget exhausted) are delivered as ordinary assistant
-// messages. Quoting them with a bold header keeps them visually distinct from
-// real model replies. Hard failures no longer use this path — they go out as
-// HTTP errors / response.failed so Codex renders its own native error card.
-function errorReply(title, detail) {
-    return '> **' + title + '**\n>\n> ' + detail;
+// 代理自己的软提示（空回合、搜索预算用尽）。它们既不是上游故障，也不该伪装成
+// 模型正文：早先以 `> **NIM proxy: ...**` 引用块混在回复里，容易被当成模型的话。
+// 现在统一走 Codex 原生错误卡片——流式用 response.failed，非流式用 HTTP 错误信封。
+function emptyReplyMessage(model) {
+    return 'NIM proxy: ' + (model ? '"' + model + '" ' : '')
+        + 'returned no text, no tool call and no reasoning this turn — usually because it emitted only its internal markup, which is filtered out. Retry once, or switch to another model.';
+}
+function webSearchLimitMessage() {
+    return 'NIM proxy: the web search budget (6 rounds) ran out before the model produced a final answer. Try rephrasing the question, or provide the details you already have.';
+}
+// 用 Error 承载提示，交给现有的错误出口（HTTP 信封 / response.failed）统一渲染。
+// notice 标志让 codexErrorEnvelope 直接用 message，而不是套成 upstream 故障格式。
+function proxyNotice(message) {
+    const err = new Error(message);
+    err.notice = true;
+    err.statusCode = 502;
+    return err;
 }
 
 // Structured single-line failure description, in the shape of a system log:
@@ -1693,7 +1698,8 @@ function upstreamErrorDetail(statusCode, err, model) {
 // 这层信封是 Codex 客户端的展示行为，代理这边唯一能控制的就是把它喂成它认得的形状。
 function codexErrorEnvelope(statusCode, err, model, endpoint) {
     const envelope = {
-        message: upstreamErrorDetail(statusCode, err, model),
+        // 代理软提示（err.notice）自带完整措辞，不能再套 upstream 故障模板。
+        message: (err && err.notice) ? err.message : upstreamErrorDetail(statusCode, err, model),
         type: 'proxy_error',
         code: 'nim_proxy_error',
         param: null,
@@ -1745,64 +1751,6 @@ async function emitResponseFailed(res, responseId, seqRef, message) {
     // 所以只有失败轮会中招——Codex 日志里该解析错误只出现在失败轮。）
     // 同时必须立刻 end：否则连接悬挂，客户端一直等不到流结束。
     try { res.end(); } catch (e) {}
-}
-
-// A turn that yields no text, no tool call and no thinking is nothing the user
-// can act on. That happens when the model emits only its internal markup (which
-// is stripped on the way out) or returns empty content — say so instead of
-// leaving a silently empty turn.
-function emptyReplyText(model) {
-    return errorReply('NIM proxy: empty reply from the model',
-        (model ? '"' + model + '" ' : '') + 'returned no text, no tool call and no reasoning this turn — usually because it emitted only its internal markup, which is filtered out. Retry once, or switch to another model.');
-}
-
-// Emit a complete assistant-message item without ending the stream, so callers
-// can keep going (used to report an otherwise-empty turn before completing).
-async function writeAssistantMessageEvents(res, itemId, text, outputIndex, state) {
-    await writeSseLine(res, JSON.stringify({
-        type: 'response.output_item.added',
-        item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
-        output_index: outputIndex,
-        sequence_number: state.seq++
-    }));
-    await writeSseLine(res, JSON.stringify({
-        type: 'response.content_part.added',
-        part: { id: itemId + '_part0', type: 'output_text', text: '' },
-        item_id: itemId,
-        output_index: outputIndex,
-        content_index: 0,
-        sequence_number: state.seq++
-    }));
-    await writeSseLine(res, JSON.stringify({
-        type: 'response.output_text.delta',
-        delta: text,
-        item_id: itemId,
-        output_index: outputIndex,
-        content_index: 0,
-        sequence_number: state.seq++
-    }));
-    await writeSseLine(res, JSON.stringify({
-        type: 'response.output_text.done',
-        text,
-        item_id: itemId,
-        output_index: outputIndex,
-        content_index: 0,
-        sequence_number: state.seq++
-    }));
-    await writeSseLine(res, JSON.stringify({
-        type: 'response.content_part.done',
-        part: { id: itemId + '_part0', type: 'output_text', text },
-        item_id: itemId,
-        output_index: outputIndex,
-        content_index: 0,
-        sequence_number: state.seq++
-    }));
-    await writeSseLine(res, JSON.stringify({
-        type: 'response.output_item.done',
-        item: { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] },
-        output_index: outputIndex,
-        sequence_number: state.seq++
-    }));
 }
 
 async function resolveHostedResponseCore(chatBody, sharedState, startRound) {
@@ -1904,9 +1852,10 @@ async function resolveHostedResponseCore(chatBody, sharedState, startRound) {
     const finalReasoning = extractReasoningText(finalMessage);
     if (finalReasoning) state.reasoningParts.push(finalReasoning);
     state.functionCalls = [];
-    state.answerText = extractTextContent(finalMessage.content)
-        || errorReply('NIM proxy: web search limit reached',
-            'No final answer was produced before the search budget ran out. Try rephrasing the question, or provide the details you already have.');
+    const finalText = extractTextContent(finalMessage.content);
+    // 预算用尽后仍然没答出来：报软提示错误卡片，不虚构一条回复。
+    if (!finalText) throw proxyNotice(webSearchLimitMessage());
+    state.answerText = finalText;
     return buildResponseObjectFromState(state);
 }
 
@@ -2438,16 +2387,13 @@ async function streamSingleRound(res, chatBody, state, roundIndex, preOpenedResp
 
     if (webSearchCalls.length === 0) {
         // Nothing the user can act on came back (no answer, no tool call) — e.g.
-        // the model emitted only its internal markup, which was stripped. Report
-        // it instead of completing a silently empty turn.
+        // the model emitted only its internal markup, which was stripped.
+        // 空回合按失败收尾，让 Codex 渲染原生错误卡片（此前是塞一条引用块伪回复）。
         if (!contentItemAdded && externalToolCalls.length === 0) {
-            await writeAssistantMessageEvents(
-                res,
-                state.responseId + '_empty_r' + roundIndex,
-                emptyReplyText(state.model),
-                nextSlot++,
-                state
-            );
+            state.streamFailed = true;
+            await emitResponseFailed(res, state.responseId, state, emptyReplyMessage(state.model));
+            state.nextSlot = nextSlot;
+            return streamResult;
         }
         await writeSseLine(res, JSON.stringify({
             type: 'response.completed',

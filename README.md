@@ -73,7 +73,7 @@ NVIDIA 会不时上架和下架模型，具体以 Codex 客户端里的实时列
 - **配置自动来回** — 启动接管、退出还原，不留残留；硬杀后可用 `--restore` 一条命令救回（见[常见问题](#常见问题)）。
 - **失效模型自动屏蔽** — 返回 404 的模型自动移出列表，24 小时后自动解禁；想马上重测就删 `model_blacklist.json` 再重启。
 - **自动重试** — 遇到 429、503 或连接失败时最多重试 5 次，指数退避并尊重上游的 `Retry-After`。
-- **报错清晰可辨** — 上游失败走 Codex 自己的错误卡片，消息里写明模型、真实状态码、原因和处理建议；只有"模型这一轮什么都没产出"和"搜索轮数用尽"这类软提示才以 `NIM proxy:` 开头的引用块显示。
+- **报错清晰可辨** — 上游失败和代理自己的提示（空回合、搜索预算用尽）都走 Codex 原生错误卡片，消息里写明模型、真实状态码、原因和处理建议，不会和模型正文混在一起。
 - **零依赖单文件** — 只用 Node.js 内置模块，不需要 `npm install`。
 
 ## 架构
@@ -168,9 +168,11 @@ Codex 只在启动时读一次模型列表，重启 Codex 客户端即可看到�
 </details>
 
 <details>
-<summary><b>Codex 弹出一条 <code>NIM proxy failed while handling /responses</code> 的错误？</b></summary>
+<summary><b>Codex 弹出一条 <code>NIM proxy</code> 开头的错误卡片？</b></summary>
 
-这是代理把上游失败如实转给 Codex，卡片里的消息形如：
+代理的失败与提示都走 Codex 原生错误卡片，消息分两类。
+
+**上游失败**——消息以 `NIM proxy failed while handling /responses` 开头，形如：
 
 ```
 NIM proxy failed while handling /responses. Provider: NVIDIA NIM; model: <模型>; upstream_status: HTTP <状态码>; cause: <原因>. <建议>
@@ -186,19 +188,12 @@ NIM proxy failed while handling /responses. Provider: NVIDIA NIM; model: <模型
 - **连不上上游（`upstream_status: HTTP unreachable`）**——重试若干次后仍无响应，检查网络。
 - **请求体超过 256MB**——会话上下文膨胀失控，换新会话；重试和换模型都救不回来。
 
+**代理自己的提示**——消息以 `NIM proxy:` 开头，没有 `upstream_status`：
+
+- **`empty reply from the model`**——模型这一轮什么都没产出：只吐了会被过滤掉的内部标记，或者干脆空回复。重试一次，或换一个模型。
+- **`web search budget (6 rounds) ran out`**——托管搜索的 6 轮预算用尽，模型仍未给出最终回答。换个问法，或把已知信息直接告诉它。
+
 模型不可用（上游 404）时代理还会把 HTTP 状态改报 400：Codex 会把没专门处理的错误状态码当成"可重试的意外"，在界面上反复 "Reconnecting" 并重采样；400 则直接显示错误信息。真实状态码仍写在消息的 `upstream_status` 里，信息不丢。
-
-</details>
-
-<details>
-<summary><b>回复里出现 <code>NIM proxy:</code> 开头的引用块？</b></summary>
-
-那是一条代理提示，不是模型正文。现在只剩两种情况会这样显示：
-
-- **`NIM proxy: empty reply from the model`** —— 模型这一轮什么都没产出：只吐了会被过滤掉的内部标记，或者干脆空回复。重试一次，或换一个模型。
-- **`NIM proxy: web search limit reached`** —— 托管搜索的 6 轮预算用尽，模型仍未给出最终回答。换个问法，或把已知信息直接告诉它。
-
-上游真正出错（额度、限流、Key、模型不可用、网络）不走引用块，而是走上面那条错误卡片。
 
 </details>
 
