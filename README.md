@@ -32,7 +32,7 @@ Windows 用户也可以直接双击 `start_proxy.bat`。
 
 代理启动时会自动接管 `~/.codex/config.toml`，把 `model_provider` 指向本地代理，把 NVIDIA 的模型写入 Codex 模型目录，并按模型的真实窗口大小写好 `model_context_window` 与自动压缩阈值（Codex 对自定义 provider 默认不自动压缩，长会话会一路把上下文撑大；写上这两项后 Codex 会在接近上限时自动压缩）。全程不需要手改任何配置。启动后打开 Codex 选模型：桌面版用模型下拉框，CLI 用 `/model`。
 
-关掉代理（在启动它的窗口按 `Ctrl+C`）会自动还原原始配置，Codex 回到只用 OpenAI 官方模型的状态。
+关掉代理（在启动它的窗口按 `Ctrl+C`）会自动还原原始配置，Codex 回到只用 OpenAI 官方模型的状态。请用 `Ctrl+C` 退出：直接杀进程（任务管理器结束任务、关掉终端窗口）不会触发还原，`config.toml` 会留在指向本代理的状态，Codex 会连不上已经停掉的 `15721`。原值不会丢——它记在 `model_state.json` 里，下次启动代理时重新接管，下次正常退出时再还回去。
 
 ## 支持的模型
 

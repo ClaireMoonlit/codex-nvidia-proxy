@@ -182,10 +182,15 @@ function captureTopLevelKeys(content) {
 // ——一旦删掉，原值就再也找不回来。第一版把它放在删除之后的 writeProxyConfig 里，
 // 测试实测 state 存下来的是空数组、退出后原值全丢，因此改到本节。
 // 已经是我们写的值（文件里有标志行）不登记，否则会把我们自己的 slug 当原值存起来。
+//
+// 反向也要管：既没有标志行、又抄不到任何键时，说明当前配置已被别的工具整份重写
+// 过（实测 cc-switch 会按自己的模板重写 config.toml），上一次登记的原值已经过期
+// ——清掉它，否则下次退出会把过期的原值"复活"到别人刚写好的配置上。
 function noteOriginals(content) {
     if (/^\s*model_provider\s*=\s*"nvidia-proxy"/m.test(content)) return;
     const captured = captureTopLevelKeys(content);
     if (captured.length > 0) writeState({ restoreTopKeys: captured });
+    else if (readState().restoreTopKeys) writeState({ restoreTopKeys: null });
 }
 
 // `restore` 为 true 时把 state 里登记的原值还原回文件并清空登记（退出路径）；
@@ -216,9 +221,11 @@ function writeProxyConfig(modelId) {
         if (fs.existsSync(CONFIG_PATH)) {
             content = fs.readFileSync(CONFIG_PATH, 'utf-8');
         }
-        // 兜底再登记一次（常规路径已在 stripProxyConfig 里登记过；这里覆盖"strip
-        // 之后 state 被清空、而文件顶层仍留着别人的值"这种边角情形）。
-        noteOriginals(content);
+        // 这里刻意**不再**登记原值：登记只能在"我们动这个文件之前"做一次，
+        // stripProxyConfig 已经做过。启动流程是 strip 在前、writeProxyConfig 在后，
+        // 此时文件里的顶层键正是被我们上一步删掉的，再登记一次只会看到"没有标志
+        // 行、也抄不到键"，反过来把上一步刚登记的原值判成过期清掉（实测 5 个用例
+        // 里 3 个因此还原失败）。
         // 先移除旧的代理配置，但保留用户自定义的其它 provider 段（如 custom）
         content = removeProxyConfig(content).trim();
 
