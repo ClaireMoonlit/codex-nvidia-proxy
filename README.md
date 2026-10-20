@@ -34,6 +34,8 @@ Windows 用户也可以直接双击 `start_proxy.bat`。
 
 关掉代理（在启动它的窗口按 `Ctrl+C`）会自动还原原始配置，Codex 回到只用 OpenAI 官方模型的状态。请用 `Ctrl+C` 退出：直接杀进程（任务管理器结束任务、关掉终端窗口）不会触发还原，`config.toml` 会留在指向本代理的状态，Codex 会连不上已经停掉的 `15721`。原值不会丢——它记在 `model_state.json` 里，下次启动代理时重新接管，下次正常退出时再还回去。
 
+如果已经这么杀过、又不想再起一轮代理，在项目目录运行 `node responses_proxy.cjs --restore` 退回原配置：它只做还原，不启动服务，也不需要 API Key。也可以手工删掉 `config.toml` 顶部以 `model_provider = "nvidia-proxy"` 开头的那几行顶层键，以及文件末尾的 `[model_providers.nvidia-proxy]` 段。
+
 ## 支持的模型
 
 ![Codex 模型下拉框中的 NIM 模型列表](docs/images/model-picker.png)

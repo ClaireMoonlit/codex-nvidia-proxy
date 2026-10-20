@@ -196,9 +196,10 @@ function noteOriginals(content) {
 // `restore` 为 true 时把 state 里登记的原值还原回文件并清空登记（退出路径）；
 // 为 false 时只做清理（启动路径：上一轮若已正常退出，原值早就还原过了，再还原
 // 一次反而会把用户后来手动改的值顶掉）。
+// 返回实际还回去的行数，供 `--restore` 打印一句如实的提示。
 function stripProxyConfig(restore) {
     try {
-        if (!fs.existsSync(CONFIG_PATH)) return;
+        if (!fs.existsSync(CONFIG_PATH)) return 0;
         const before = fs.readFileSync(CONFIG_PATH, 'utf-8');
         noteOriginals(before);
         const state = readState();
@@ -210,8 +211,10 @@ function stripProxyConfig(restore) {
         if (restore && restoreLines.length > 0) {
             writeState({ restoreTopKeys: null });
         }
+        return restoreLines.length;
     } catch (e) {
         console.warn('[Proxy] Failed to strip proxy config:', e.message);
+        return 0;
     }
 }
 
@@ -356,6 +359,18 @@ process.on('SIGTERM', () => {
     stripProxyConfig(true);
     process.exit(0);
 });
+
+// `--restore`：只还原配置，不启动代理。硬杀代理后 config.toml 会一直指向已经
+// 停掉的 15721，而还原只在"代理自己正常退出"时发生；这个入口让用户不必再完整
+// 起一轮代理，一条命令就能退回官方配置。
+// 放在 API Key 检查之前：还原不需要 Key。也不监听端口，不会和谁抢 15721。
+if (process.argv.includes('--restore')) {
+    const restored = stripProxyConfig(true);
+    console.log(restored > 0
+        ? '[Proxy] Restored ' + restored + ' overridden config line(s); proxy entries removed.'
+        : '[Proxy] Proxy entries removed; nothing saved to restore.');
+    process.exit(0);
+}
 
 if (!NVIDIA_API_KEY) {
     console.error('[Proxy] ERROR: NVIDIA_API_KEY environment variable is required.');
