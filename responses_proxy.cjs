@@ -1064,8 +1064,13 @@ function convertRequest(responsesBody) {
     return chatBody;
 }
 
-function forwardRequest(req, bodyStr) {
+function forwardRequest(req, bodyStr, signal) {
     return new Promise((resolve, reject) => {
+        // 客户端在等首字节期间已经断开：不必再发上游请求
+        if (signal && signal.aborted) {
+            reject(new Error('Client disconnected'));
+            return;
+        }
         const start = Date.now();
         const options = {
             hostname: NVIDIA_HOST,
@@ -1088,6 +1093,16 @@ function forwardRequest(req, bodyStr) {
             // TTFB 观测：大上下文时这段是"排队 + prefill"，是请求耗时的大头
             log('NVIDIA response received, status:', proxyRes.statusCode, 'ttfb:', (Date.now() - start) + 'ms');
             resolve({ stream: true, response: proxyRes });
+        });
+
+        // 断开时立刻销毁上游请求，让重试循环尽快结束，而不是继续等 300s 超时
+        const onAbort = () => {
+            try { proxyReq.destroy(new Error('Client disconnected')); } catch (e) {}
+        };
+        if (signal) signal.addEventListener('abort', onAbort, { once: true });
+        // 请求生命周期结束后摘掉监听，避免长连接上堆积闭包
+        proxyReq.on('close', () => {
+            if (signal) signal.removeEventListener('abort', onAbort);
         });
 
         proxyReq.on('timeout', () => {
@@ -1472,11 +1487,25 @@ async function resolveHostedResponseStreaming(res, chatBody, endpoint) {
     // 我们还能返回一个**真实的 HTTP 状态码 + JSON**，让 Codex 渲染它自己的原生
     // 错误卡片——没有 "Reconnecting N/5"，也没有 "stream disconnected before
     // completion:" 前缀。一旦 writeHead(200) 写出去，就只剩 SSE 一条路了。
+    // 等首字节的这段时间可能长达数分钟，客户端（Codex 桌面版关窗/暂停、CLI Ctrl+C）
+    // 可能早已断开。此前这段没有 close 监听，代理会把全部重试跑完（最坏 6×300s），
+    // 白占上游连接。这里提前挂监听，断开即中止上游请求并停止重试；
+    // 监听常驻到请求结束，与后面流开始后的 onClientClose 并存，不冲突。
+    const earlyAbort = new AbortController();
+    res.on('close', () => {
+        tempState.clientGone = true;
+        earlyAbort.abort();
+    });
+
     let firstResponse;
     try {
-        const opened = await forwardRequestWithRetry(null, JSON.stringify(workingChatBody));
+        const opened = await forwardRequestWithRetry(null, JSON.stringify(workingChatBody), undefined, earlyAbort.signal);
         firstResponse = opened.response;
     } catch (e) {
+        if (earlyAbort.signal.aborted) {
+            log('STREAM_MAIN: client disconnected while waiting for upstream, retries aborted');
+            return;
+        }
         // 重试耗尽仍连不上上游：这是"流开始前"的失败，回 502。
         log('STREAM_MAIN: upstream unreachable before stream start:', e.message);
         res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -2666,12 +2695,14 @@ function computeRetryDelayMs(attemptNumber, retryAfterHeader) {
     return baseDelay + jitter;
 }
 
-async function forwardRequestWithRetry(req, bodyStr, maxRetries) {
+async function forwardRequestWithRetry(req, bodyStr, maxRetries, signal) {
     if (maxRetries === undefined) maxRetries = 5;
+    const clientGone = () => !!(signal && signal.aborted);
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        if (clientGone()) throw new Error('Client disconnected');
         try {
-            const result = await forwardRequest(req, bodyStr);
+            const result = await forwardRequest(req, bodyStr, signal);
 
             if (result.response.statusCode === 200) {
                 return result;
@@ -2682,6 +2713,7 @@ async function forwardRequestWithRetry(req, bodyStr, maxRetries) {
                     let errBody = '';
                     result.response.on('data', c => errBody += c);
                     await new Promise(r => result.response.on('end', r));
+                    if (clientGone()) throw new Error('Client disconnected');
                     const retryAfterHeader = result.response.headers['retry-after'];
                     const delayMs = computeRetryDelayMs(attempt + 1, retryAfterHeader);
                     log(
@@ -2698,12 +2730,16 @@ async function forwardRequestWithRetry(req, bodyStr, maxRetries) {
 
             return result;
         } catch (e) {
-            log('Retry ' + (attempt + 1) + '/' + maxRetries + ' after error:', e.message);
+            // 客户端已走人：不再重试，直接把调用栈收掉
+            if (clientGone()) throw new Error('Client disconnected');
             if (attempt < maxRetries) {
                 const delayMs = computeRetryDelayMs(attempt + 1);
+                log('Retry ' + (attempt + 1) + '/' + maxRetries + ' after error:', e.message);
                 await new Promise(r => setTimeout(r, delayMs));
                 continue;
             }
+            // 走到这里说明已经用完 maxRetries 次重试，不再有下一次，日志不能写成 "Retry N+1/N"
+            log('Upstream failed after ' + maxRetries + ' retries:', e.message);
             throw e;
         }
     }
