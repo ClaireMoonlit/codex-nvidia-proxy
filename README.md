@@ -244,6 +244,7 @@ codex-nvidia-proxy/
 ├── proxy-crash.log        # 进程存亡记录：启动、信号、退出码、崩溃堆栈（自动生成）
 ├── tool_dump.json         # Codex 下发的工具列表，仅 DEBUG=true 时生成
 ├── docs/images/           # README 配图
+├── .github/workflows/stale.yml  # 仓库运维：30 天无活动的 issue 自动打标签并关闭
 ├── package.json           # 项目元数据（无外部依赖）
 └── LICENSE
 ```
