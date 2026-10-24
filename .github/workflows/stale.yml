@@ -1,0 +1,35 @@
+name: Close Stale Issues
+
+on:
+  schedule:
+    # 每天 00:00 UTC（北京时间 08:00）检查一次
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v10
+        with:
+          # 30 天无活动标记 stale，再等 14 天无人回复则关闭
+          days-before-stale: 30
+          days-before-close: 14
+          stale-issue-label: 'stale'
+          stale-issue-message: |
+            此 issue 已超过 30 天没有活动，已被标记为 stale。
+            如果问题仍然存在，请回复以保持打开，否则将在 14 天后自动关闭。
+            This issue has been automatically marked as stale because it has not had activity for 30 days.
+            Please reply to keep it open, otherwise it will be closed in 14 days.
+          close-issue-message: |
+            此 issue 因长时间无活动被自动关闭。如果问题仍然存在，欢迎重新打开或新开一条。
+            This issue was closed automatically due to inactivity. If the problem persists, feel free to reopen it.
+          # 这些标签的 issue 不会被标记 stale
+          exempt-issue-labels: 'security,pinned'
+          # 只处理 issue，不碰 PR
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+          operations-per-run: 30
